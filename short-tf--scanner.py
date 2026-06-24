@@ -50,7 +50,7 @@ MA_PERIOD = 50  # Shorter MA for trend filter
 # ============================================
 # POSITION SIZING CONFIGURATION
 # ============================================
-ACCOUNT_SIZE = 10000  # $10,000 account
+ACCOUNT_SIZE = 50000  # $10,000 account
 MAX_RISK_PER_TRADE = 0.015  # 1.5% risk per trade (tighter for short-term)
 MAX_POSITIONS = 5  # More positions for short-term scalping
 
