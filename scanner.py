@@ -24,7 +24,6 @@ SPOT_SYMBOLS = [
     'TRX/USDT', 'UNI/USDT', 'VIRTUAL/USDT', 'WLD/USDT', 
     'ZEC/USDT'
 ]
-]
 
 # Futures symbols (for metals and other perpetuals)
 FUTURES_SYMBOLS = [
