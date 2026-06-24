@@ -48,7 +48,7 @@ This scanner automatically detects **mean-reversion trading opportunities** acro
 
 ### 1. Clone or Download
 ```bash
-git clone <your-repo-url> # Replace with your actual repository URL
+git clone https://github.com/shadiayoub/crypto-scanner
 cd scanner-bot
 ```
 
