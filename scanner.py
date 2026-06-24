@@ -304,7 +304,11 @@ def calculate_position_size(price, stop_loss, confidence, account_size, risk_per
 # SUGGESTED ENTRY/EXIT PRICES (3 TARGETS)
 # ============================================
 
-def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_val, params):
+def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_val, params, rsi_1h=None):
+    """
+    Calculate suggested entry, stop loss, and take profit levels
+    With entry adjustment for higher timeframe divergence
+    """
     result = {
         'entry': price,
         'stop_loss': None,
@@ -324,8 +328,25 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
     tp2_pct = params['target_2_pct']
     tp3_pct = params['target_3_pct']
     
+    # ============================================
+    # ENTRY PRICE ADJUSTMENT FOR DIVERGENCE
+    # ============================================
+    entry_adjustment = 0
+    
+    if rsi_1h is not None:
+        if signal_type.startswith('SELL') and rsi_1h < 30:
+            # 1h oversold - only sell on a bounce (higher price)
+            adjustment_pct = ((30 - rsi_1h) / 30) * 0.02  # Up to 2% higher
+            entry_adjustment = price * adjustment_pct
+        elif signal_type.startswith('BUY') and rsi_1h > 70:
+            # 1h overbought - only buy on a dip (lower price)
+            adjustment_pct = ((rsi_1h - 70) / 30) * 0.02  # Up to 2% lower
+            entry_adjustment = -price * adjustment_pct
+    
+    adjusted_entry = price + entry_adjustment
+    
     if signal_type.startswith('BUY'):
-        entry = max(price, lower * 1.005)
+        entry = max(adjusted_entry, lower * 1.005)
         result['entry'] = round(entry, 4)
         
         stop = min(price * (1 - stop_distance), lower * (1 - stop_distance * 0.4))
@@ -352,7 +373,7 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
             result['risk_reward_3'] = round((tp3 - entry) / risk, 2)
         
     elif signal_type.startswith('SELL'):
-        entry = min(price, upper * 0.995)
+        entry = min(adjusted_entry, upper * 0.995)
         result['entry'] = round(entry, 4)
         
         stop = max(price * (1 + stop_distance), upper * (1 + stop_distance * 0.4))
@@ -381,7 +402,7 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
     return result
 
 # ============================================
-# ENHANCED SIGNAL DETECTION
+# ENHANCED SIGNAL DETECTION WITH HIGHER TIMEFRAME OVERRULE
 # ============================================
 
 def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
@@ -391,6 +412,7 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
     
     rsi_period = params['rsi_period']
     ma_period = params['ma_period']
+    confirm_tf = params['confirmation_timeframe']
     
     # 1. CROSSOVER SIGNAL
     if current > lower and prev <= lower and rsi_val < 45:
@@ -444,6 +466,13 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
                 'base_confidence': 60,
                 'description': f'Price {abs(upper_dist):.1f}% above upper band'
             })
+    
+    # ============================================
+    # FETCH HIGHER TIMEFRAME RSI FOR OVERRULE LOGIC
+    # ============================================
+    confirms_1h, rsi_1h = check_timeframe_confirmation(
+        symbol, confirm_tf, rsi_period, rsi_threshold=35
+    )
     
     # APPLY FILTERS
     enhanced_signals = []
@@ -511,21 +540,17 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
                         confidence -= 10
                         filters_triggered.append(f"⚠️ Far above MA{ma_period}")
         
-        # FILTER 3: Timeframe Confirmation
-        confirm_tf = params['confirmation_timeframe']
-        confirms, rsi_confirm = check_timeframe_confirmation(
-            symbol, confirm_tf, rsi_period, rsi_threshold=35
-        )
-        if confirms is not None:
-            if confirms:
+        # FILTER 3: Timeframe Confirmation (Standard)
+        if confirms_1h is not None:
+            if confirms_1h:
                 confidence += 15
-                filters_triggered.append(f"✅ {confirm_tf} confirms (RSI {rsi_confirm})")
+                filters_triggered.append(f"✅ {confirm_tf} confirms (RSI {rsi_1h})")
             else:
                 confidence -= 15
-                filters_triggered.append(f"⚠️ {confirm_tf} not confirming (RSI {rsi_confirm})")
-                if signal['type'].startswith('BUY') and rsi_confirm > 45:
+                filters_triggered.append(f"⚠️ {confirm_tf} not confirming (RSI {rsi_1h})")
+                if signal['type'].startswith('BUY') and rsi_1h > 45:
                     confidence -= 10
-                elif signal['type'].startswith('SELL') and rsi_confirm < 55:
+                elif signal['type'].startswith('SELL') and rsi_1h < 55:
                     confidence -= 10
         
         # FILTER 4: RSI Divergence Check
@@ -548,6 +573,50 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
                 confidence -= 15
                 filters_triggered.append(f"⚠️ Sharp rise {recent_change:.1f}%")
         
+        # ============================================
+        # FILTER 6: HIGHER TIMEFRAME OVERRULE LOGIC
+        # ============================================
+        if rsi_1h is not None:
+            
+            # --- SELL SIGNAL OVERRULE ---
+            if signal['type'].startswith('SELL'):
+                if rsi_1h < 30:
+                    confidence -= 30
+                    filters_triggered.append(f"⚠️ CRITICAL: 1h RSI {rsi_1h} < 30 (oversold) - SELL downgraded")
+                    
+                    if rsi_1h < 20:
+                        confidence -= 10
+                        filters_triggered.append(f"⚠️ EXTREME: 1h RSI {rsi_1h} < 20 - SELL likely false")
+                    
+                    if confidence < 40:
+                        skip_signal = True
+                        filters_triggered.append("❌ Signal skipped - 1h oversold contradicts SELL")
+                
+                elif rsi_1h < 40:
+                    confidence -= 15
+                    filters_triggered.append(f"⚠️ 1h RSI {rsi_1h} (oversold) - reduce confidence")
+            
+            # --- BUY SIGNAL OVERRULE ---
+            elif signal['type'].startswith('BUY'):
+                if rsi_1h > 70:
+                    confidence -= 30
+                    filters_triggered.append(f"⚠️ CRITICAL: 1h RSI {rsi_1h} > 70 (overbought) - BUY downgraded")
+                    
+                    if rsi_1h > 80:
+                        confidence -= 10
+                        filters_triggered.append(f"⚠️ EXTREME: 1h RSI {rsi_1h} > 80 - BUY likely false")
+                    
+                    if confidence < 40:
+                        skip_signal = True
+                        filters_triggered.append("❌ Signal skipped - 1h overbought contradicts BUY")
+                
+                elif rsi_1h > 60:
+                    confidence -= 15
+                    filters_triggered.append(f"⚠️ 1h RSI {rsi_1h} (overbought) - reduce confidence")
+        
+        # ============================================
+        # FINAL CONFIDENCE CALCULATION
+        # ============================================
         confidence = max(0, min(100, confidence))
         
         if confidence < 50:
@@ -559,7 +628,8 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
                 'confidence': round(confidence, 1),
                 'description': signal['description'],
                 'filters': filters_triggered,
-                'base_confidence': signal['base_confidence']
+                'base_confidence': signal['base_confidence'],
+                'rsi_1h': rsi_1h  # Pass through for entry adjustment
             })
     
     enhanced_signals.sort(key=lambda x: x['confidence'], reverse=True)
@@ -572,10 +642,6 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
 def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positions):
     params = get_timeframe_params(timeframe)
     results = []
-    
-    # Override with CLI args if provided
-    risk_percent = risk_percent
-    max_positions = max_positions
     
     print(f"\n{'='*110}")
     print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
@@ -614,7 +680,8 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
                 
                 entry_exit = calculate_entry_exit(
                     current_price, lower, upper, mid,
-                    best['type'], best['confidence'], rsi_val, params
+                    best['type'], best['confidence'], rsi_val, params,
+                    rsi_1h=best.get('rsi_1h')  # Pass the 1h RSI for entry adjustment
                 )
                 
                 position_size = calculate_position_size(
