@@ -1,0 +1,44 @@
+# Default: 1h timeframe
+python scanner.py
+
+# 15-minute timeframe (day trading)
+python scanner.py -tf 15m
+
+# 5-minute timeframe (scalping)
+python scanner.py -tf 5m
+
+# 4-hour timeframe (swing trading)
+python scanner.py -tf 4h
+
+# 1-day timeframe (position trading)
+python scanner.py -tf 1d
+
+# Verbose mode (shows all symbols, not just signals)
+python scanner.py -tf 15m -v
+
+# Custom account size and risk
+python scanner.py -tf 30m --account-size 50000 --risk 0.015
+
+# Max positions
+python scanner.py -tf 5m --max-positions 8
+
+# List all available timeframes
+python scanner.py --list-timeframes
+
+# Help
+python scanner.py --help
+
+# Scalping (5m) - Run every 5 minutes
+*/5 * * * * cd /path/to/scanner && python scanner.py -tf 5m
+
+# Day trading (15m) - Run every 15 minutes
+*/15 * * * * cd /path/to/scanner && python scanner.py -tf 15m
+
+# Swing trading (1h) - Run every 2 hours
+0 */2 * * * cd /path/to/scanner && python scanner.py -tf 1h
+
+# Position trading (4h) - Run every 4 hours
+0 */4 * * * cd /path/to/scanner && python scanner.py -tf 4h
+
+# Long-term (1d) - Run daily
+0 0 * * * cd /path/to/scanner && python scanner.py -tf 1d

@@ -1,14 +1,93 @@
+#!/usr/bin/env python3
+"""
+Multi-Asset Scanner with Nadaraya-Watson Envelope
+Supports both long-term and short-term timeframes via command-line arguments
+
+Usage:
+    python scanner.py                    # Default: 1h timeframe
+    python scanner.py -tf 15m            # 15-minute timeframe
+    python scanner.py -tf 5m             # 5-minute timeframe
+    python scanner.py -tf 4h             # 4-hour timeframe
+    python scanner.py -tf 1h -v          # 1h with verbose output
+    python scanner.py --help             # Show help
+"""
+
 import ccxt
 import pandas as pd
 import numpy as np
 from datetime import datetime
 import time
 import warnings
+import argparse
+import sys
 warnings.filterwarnings('ignore')
+
+# ============================================
+# ARGUMENT PARSING
+# ============================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Multi-Asset Scanner with Nadaraya-Watson Envelope',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python scanner.py                    # Default: 1h timeframe
+  python scanner.py -tf 15m            # 15-minute timeframe
+  python scanner.py -tf 5m             # 5-minute timeframe (scalping)
+  python scanner.py -tf 30m            # 30-minute timeframe
+  python scanner.py -tf 4h             # 4-hour timeframe
+  python scanner.py -tf 1h -v          # Verbose mode with all filters
+  python scanner.py --list-timeframes  # Show all available timeframes
+        """
+    )
+    
+    parser.add_argument(
+        '-tf', '--timeframe',
+        type=str,
+        default='1h',
+        help='Timeframe to scan (default: 1h). Options: 1m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d'
+    )
+    
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose output (shows all symbols, not just signals)'
+    )
+    
+    parser.add_argument(
+        '--list-timeframes',
+        action='store_true',
+        help='Show all available timeframes and exit'
+    )
+    
+    parser.add_argument(
+        '--account-size',
+        type=float,
+        default=10000,
+        help='Account size in USD (default: 10000)'
+    )
+    
+    parser.add_argument(
+        '--risk',
+        type=float,
+        default=0.02,
+        help='Risk per trade as percentage (default: 0.02 = 2%%)'
+    )
+    
+    parser.add_argument(
+        '--max-positions',
+        type=int,
+        default=3,
+        help='Maximum concurrent positions (default: 3)'
+    )
+    
+    return parser.parse_args()
 
 # ============================================
 # CONFIGURATION
 # ============================================
+
 # Spot symbols (standard)
 SPOT_SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT',
@@ -34,20 +113,82 @@ FUTURES_SYMBOLS = [
 # Combine all symbols
 SYMBOLS = SPOT_SYMBOLS + FUTURES_SYMBOLS
 
-TIMEFRAME = '1h'
-TIMEFRAME_15M = '15m'
-LOOKBACK = 500
-BANDWIDTH = 6.0
-MULTIPLIER = 3.0
-RSI_PERIOD = 14
-MA_PERIOD = 200
+# ============================================
+# TIMEFRAME-SPECIFIC PARAMETERS
+# ============================================
 
-# ============================================
-# POSITION SIZING CONFIGURATION
-# ============================================
-ACCOUNT_SIZE = 10000  # $10,000 account (adjust to your size)
-MAX_RISK_PER_TRADE = 0.02  # 2% of account = $200 risk per trade
-MAX_POSITIONS = 3  # Maximum number of concurrent positions
+def get_timeframe_params(timeframe):
+    """
+    Returns optimized parameters for each timeframe
+    """
+    params = {
+        'lookback': 500,
+        'bandwidth': 6.0,
+        'multiplier': 3.0,
+        'rsi_period': 14,
+        'ma_period': 200,
+        'confirmation_timeframe': '15m',
+        'max_positions': 3,
+        'risk_per_trade': 0.02,
+        'stop_distance': 0.025,  # 2.5%
+        'target_1_pct': 0.03,    # 3%
+        'target_2_pct': 0.05,    # 5%
+        'target_3_pct': 0.07,    # 7%
+        'filters': ['volume', 'ma', 'confirmation']
+    }
+    
+    # Short-term timeframes (scalping/day trading)
+    if timeframe in ['1m', '5m', '15m']:
+        params.update({
+            'lookback': 200,
+            'bandwidth': 3.5,
+            'multiplier': 2.0,
+            'rsi_period': 8,
+            'ma_period': 50,
+            'confirmation_timeframe': '1h',
+            'max_positions': 8,
+            'risk_per_trade': 0.01,
+            'stop_distance': 0.015,  # 1.5%
+            'target_1_pct': 0.015,   # 1.5%
+            'target_2_pct': 0.025,   # 2.5%
+            'target_3_pct': 0.04,    # 4%
+        })
+    
+    # Medium-term timeframes (day trading)
+    elif timeframe in ['30m', '1h']:
+        params.update({
+            'lookback': 300 if timeframe == '30m' else 500,
+            'bandwidth': 4.5 if timeframe == '30m' else 6.0,
+            'multiplier': 2.5 if timeframe == '30m' else 3.0,
+            'rsi_period': 10 if timeframe == '30m' else 14,
+            'ma_period': 100 if timeframe == '30m' else 200,
+            'confirmation_timeframe': '1h' if timeframe == '30m' else '15m',
+            'max_positions': 5 if timeframe == '30m' else 3,
+            'risk_per_trade': 0.015 if timeframe == '30m' else 0.02,
+            'stop_distance': 0.02 if timeframe == '30m' else 0.025,
+            'target_1_pct': 0.02 if timeframe == '30m' else 0.03,
+            'target_2_pct': 0.035 if timeframe == '30m' else 0.05,
+            'target_3_pct': 0.05 if timeframe == '30m' else 0.07,
+        })
+    
+    # Long-term timeframes (swing/position trading)
+    elif timeframe in ['2h', '4h', '6h', '12h', '1d']:
+        params.update({
+            'lookback': 500,
+            'bandwidth': 7.0 if timeframe in ['4h', '6h'] else 8.0,
+            'multiplier': 3.5 if timeframe in ['4h', '6h'] else 4.0,
+            'rsi_period': 14,
+            'ma_period': 200,
+            'confirmation_timeframe': '1h',
+            'max_positions': 3,
+            'risk_per_trade': 0.02,
+            'stop_distance': 0.03,   # 3%
+            'target_1_pct': 0.04,    # 4%
+            'target_2_pct': 0.07,    # 7%
+            'target_3_pct': 0.10,    # 10%
+        })
+    
+    return params
 
 # ============================================
 # INDICATOR FUNCTIONS
@@ -56,15 +197,15 @@ MAX_POSITIONS = 3  # Maximum number of concurrent positions
 def gaussian_kernel(x, h):
     return np.exp(-(x**2) / (2 * h**2))
 
-def nadaraya_watson_envelope(price, h, mult):
+def nadaraya_watson_envelope(price, h, mult, lookback):
     n = len(price)
-    if n < 500:
+    if n < lookback:
         return None, None, None
     
-    price_array = np.array(price[-500:])
-    smoothed = np.zeros(500)
-    for i in range(500):
-        w = gaussian_kernel(np.arange(500) - i, h)
+    price_array = np.array(price[-lookback:])
+    smoothed = np.zeros(lookback)
+    for i in range(lookback):
+        w = gaussian_kernel(np.arange(lookback) - i, h)
         smoothed[i] = np.sum(price_array * w) / np.sum(w)
     
     mae = np.mean(np.abs(price_array - smoothed)) * mult
@@ -96,28 +237,18 @@ def rsi(price, period=14):
     return 100 - (100 / (1 + rs))
 
 def fetch_data(symbol, timeframe, limit=550):
-    """
-    Fetch data from Binance — automatically handles spot and futures
-    """
     try:
-        # Determine if it's a futures symbol (contains ':')
         is_futures = ':' in symbol
         
         if is_futures:
-            # Use futures exchange
             exchange = ccxt.binanceusdm({
                 'enableRateLimit': True,
-                'options': {
-                    'defaultType': 'future'
-                }
+                'options': {'defaultType': 'future'}
             })
         else:
-            # Use spot exchange
             exchange = ccxt.binance({
                 'enableRateLimit': True,
-                'options': {
-                    'defaultType': 'spot'
-                }
+                'options': {'defaultType': 'spot'}
             })
         
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
@@ -128,13 +259,13 @@ def fetch_data(symbol, timeframe, limit=550):
         print(f"⚠️ {symbol}: fetch error - {str(e)[:60]}")
         return None
 
-def check_timeframe_confirmation(symbol, timeframe, rsi_threshold=35):
+def check_timeframe_confirmation(symbol, timeframe, rsi_period, rsi_threshold=35):
     df = fetch_data(symbol, timeframe, limit=100)
     if df is None or len(df) < 50:
         return False, None
     
     close = df['close'].values
-    rsi_val = rsi(close[-RSI_PERIOD-20:], RSI_PERIOD)
+    rsi_val = rsi(close[-rsi_period-20:], rsi_period)
     confirms = rsi_val < rsi_threshold
     return confirms, round(rsi_val, 2)
 
@@ -142,38 +273,21 @@ def check_timeframe_confirmation(symbol, timeframe, rsi_threshold=35):
 # POSITION SIZING CALCULATOR
 # ============================================
 
-def calculate_position_size(price, stop_loss, confidence, account_size=ACCOUNT_SIZE, risk_percent=MAX_RISK_PER_TRADE):
-    """
-    Calculate position size based on:
-    - Risk per trade (fixed % of account)
-    - Stop loss distance
-    - Signal confidence (adjusts risk)
-    - Maximum position limit
-    """
-    # Base risk amount
+def calculate_position_size(price, stop_loss, confidence, account_size, risk_percent):
     base_risk = account_size * risk_percent
-    
-    # Adjust risk based on confidence (scale 0.5x to 1.5x)
-    confidence_multiplier = 0.5 + (confidence / 100) * 1.0  # 50% confidence = 1.0x, 90% = 1.4x
+    confidence_multiplier = 0.5 + (confidence / 100) * 1.0
     adjusted_risk = base_risk * confidence_multiplier
     
-    # Calculate risk per unit (stop loss distance)
     risk_per_unit = abs(price - stop_loss)
-    
-    # Position size (units)
     position_size = adjusted_risk / risk_per_unit if risk_per_unit > 0 else 0
-    
-    # Position value
     position_value = position_size * price
     
-    # Cap position to 50% of account per trade
     max_position_value = account_size * 0.5
     if position_value > max_position_value:
         position_size = max_position_value / price
         position_value = max_position_value
     
-    # Minimum position (to avoid dust)
-    min_position_value = 50  # $50 minimum
+    min_position_value = 50
     if position_value < min_position_value:
         position_size = min_position_value / price
         position_value = min_position_value
@@ -187,73 +301,82 @@ def calculate_position_size(price, stop_loss, confidence, account_size=ACCOUNT_S
     }
 
 # ============================================
-# SUGGESTED ENTRY/EXIT PRICES
+# SUGGESTED ENTRY/EXIT PRICES (3 TARGETS)
 # ============================================
 
-def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_val):
-    """
-    Calculate suggested entry, stop loss, and take profit levels
-    """
+def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_val, params):
     result = {
         'entry': price,
         'stop_loss': None,
         'take_profit_1': None,
         'take_profit_2': None,
+        'take_profit_3': None,
         'target_1_gain': None,
         'target_2_gain': None,
+        'target_3_gain': None,
         'risk_reward_1': None,
-        'risk_reward_2': None
+        'risk_reward_2': None,
+        'risk_reward_3': None
     }
     
+    stop_distance = params['stop_distance']
+    tp1_pct = params['target_1_pct']
+    tp2_pct = params['target_2_pct']
+    tp3_pct = params['target_3_pct']
+    
     if signal_type.startswith('BUY'):
-        # ENTRY: Current price or slightly above lower band
-        entry = max(price, lower * 1.005)  # Slight premium to avoid fake breakout
+        entry = max(price, lower * 1.005)
         result['entry'] = round(entry, 4)
         
-        # STOP LOSS: Below recent swing low or lower band
-        stop = min(price * 0.975, lower * 0.99)  # 2.5% below or lower band
+        stop = min(price * (1 - stop_distance), lower * (1 - stop_distance * 0.4))
         result['stop_loss'] = round(stop, 4)
         
-        # TAKE PROFIT 1: Conservative (3-5% gain)
-        tp1 = entry * (1 + (0.03 + (confidence / 100) * 0.02))  # 3-5%
+        tp1 = min(mid, entry * (1 + tp1_pct * 0.5))
+        if tp1 <= entry:
+            tp1 = entry * (1 + tp1_pct * 0.5)
         result['take_profit_1'] = round(tp1, 4)
         
-        # TAKE PROFIT 2: Aggressive (5-10% gain)
-        tp2 = entry * (1 + (0.05 + (confidence / 100) * 0.05))  # 5-10%
+        tp2 = entry * (1 + tp1_pct + (confidence / 100) * tp1_pct * 0.5)
         result['take_profit_2'] = round(tp2, 4)
         
-        # Calculate risk/reward
+        tp3 = entry * (1 + tp2_pct + (confidence / 100) * tp2_pct * 0.5)
+        result['take_profit_3'] = round(tp3, 4)
+        
         risk = entry - stop
         if risk > 0:
             result['target_1_gain'] = round((tp1 - entry) / entry * 100, 2)
             result['target_2_gain'] = round((tp2 - entry) / entry * 100, 2)
+            result['target_3_gain'] = round((tp3 - entry) / entry * 100, 2)
             result['risk_reward_1'] = round((tp1 - entry) / risk, 2)
             result['risk_reward_2'] = round((tp2 - entry) / risk, 2)
+            result['risk_reward_3'] = round((tp3 - entry) / risk, 2)
         
     elif signal_type.startswith('SELL'):
-        # ENTRY: Current price or slightly below upper band
-        entry = min(price, upper * 0.995)  # Slight discount to avoid fake breakdown
+        entry = min(price, upper * 0.995)
         result['entry'] = round(entry, 4)
         
-        # STOP LOSS: Above recent swing high or upper band
-        stop = max(price * 1.025, upper * 1.01)  # 2.5% above or upper band
+        stop = max(price * (1 + stop_distance), upper * (1 + stop_distance * 0.4))
         result['stop_loss'] = round(stop, 4)
         
-        # TAKE PROFIT 1: Conservative (3-5% gain)
-        tp1 = entry * (1 - (0.03 + (confidence / 100) * 0.02))
+        tp1 = max(mid, entry * (1 - tp1_pct * 0.5))
+        if tp1 >= entry:
+            tp1 = entry * (1 - tp1_pct * 0.5)
         result['take_profit_1'] = round(tp1, 4)
         
-        # TAKE PROFIT 2: Aggressive (5-10% gain)
-        tp2 = entry * (1 - (0.05 + (confidence / 100) * 0.05))
+        tp2 = entry * (1 - tp1_pct - (confidence / 100) * tp1_pct * 0.5)
         result['take_profit_2'] = round(tp2, 4)
         
-        # Calculate risk/reward
+        tp3 = entry * (1 - tp2_pct - (confidence / 100) * tp2_pct * 0.5)
+        result['take_profit_3'] = round(tp3, 4)
+        
         risk = stop - entry
         if risk > 0:
             result['target_1_gain'] = round((entry - tp1) / entry * 100, 2)
             result['target_2_gain'] = round((entry - tp2) / entry * 100, 2)
+            result['target_3_gain'] = round((entry - tp3) / entry * 100, 2)
             result['risk_reward_1'] = round((entry - tp1) / risk, 2)
             result['risk_reward_2'] = round((entry - tp2) / risk, 2)
+            result['risk_reward_3'] = round((entry - tp3) / risk, 2)
     
     return result
 
@@ -261,22 +384,25 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
 # ENHANCED SIGNAL DETECTION
 # ============================================
 
-def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol):
+def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
     current = price[-1]
     prev = price[-2]
     signals = []
     
+    rsi_period = params['rsi_period']
+    ma_period = params['ma_period']
+    
     # 1. CROSSOVER SIGNAL
-    if current > lower and prev <= lower and rsi_val < 40:
-        base_confidence = min(90, (40 - rsi_val) * 2 + 50)
+    if current > lower and prev <= lower and rsi_val < 45:
+        base_confidence = min(85, (45 - rsi_val) * 2 + 45)
         signals.append({
             'type': 'BUY_CROSS',
             'base_confidence': base_confidence,
             'description': 'Bullish cross above lower band'
         })
     
-    if current < upper and prev >= upper and rsi_val > 60:
-        base_confidence = min(90, (rsi_val - 60) * 2 + 50)
+    if current < upper and prev >= upper and rsi_val > 55:
+        base_confidence = min(85, (rsi_val - 55) * 2 + 45)
         signals.append({
             'type': 'SELL_CROSS',
             'base_confidence': base_confidence,
@@ -284,16 +410,16 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol):
         })
     
     # 2. OVERSOLD/OVERBOUGHT BOUNCE
-    if rsi_val < 30 and current < lower * 1.02:
-        base_confidence = min(80, (30 - rsi_val) * 3 + 40)
+    if rsi_val < 35 and current < lower * 1.03:
+        base_confidence = min(75, (35 - rsi_val) * 3 + 35)
         signals.append({
             'type': 'BUY_OVERSOLD',
             'base_confidence': base_confidence,
-            'description': f'Deep oversold (RSI {rsi_val:.1f}) near lower band'
+            'description': f'Oversold (RSI {rsi_val:.1f}) near lower band'
         })
     
-    if rsi_val > 70 and current > upper * 0.98:
-        base_confidence = min(80, (rsi_val - 70) * 3 + 40)
+    if rsi_val > 65 and current > upper * 0.97:
+        base_confidence = min(75, (rsi_val - 65) * 3 + 35)
         signals.append({
             'type': 'SELL_OVERBOUGHT',
             'base_confidence': base_confidence,
@@ -303,19 +429,19 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol):
     # 3. ENVELOPE EXTREME
     if lower is not None and lower > 0:
         lower_dist = ((current - lower) / current) * 100
-        if lower_dist < -3:
+        if lower_dist < -2:
             signals.append({
                 'type': 'EXTREME_OVERSOLD',
-                'base_confidence': 65,
+                'base_confidence': 60,
                 'description': f'Price {abs(lower_dist):.1f}% below lower band'
             })
     
     if upper is not None and upper > 0:
         upper_dist = ((upper - current) / current) * 100
-        if upper_dist < -3:
+        if upper_dist < -2:
             signals.append({
                 'type': 'EXTREME_OVERBOUGHT',
-                'base_confidence': 65,
+                'base_confidence': 60,
                 'description': f'Price {abs(upper_dist):.1f}% above upper band'
             })
     
@@ -324,113 +450,178 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol):
     for signal in signals:
         confidence = signal['base_confidence']
         filters_triggered = []
+        skip_signal = False
         
-        # FILTER 1: Volume
-        if len(volume) > 20:
-            avg_volume = np.mean(volume[-20:])
+        # FILTER 1: Volume Analysis
+        if len(volume) > 15:
+            avg_volume = np.mean(volume[-15:])
             current_volume = volume[-1]
             volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
             
-            if volume_ratio > 1.5:
-                confidence += 10
-                filters_triggered.append(f"🔥 Volume {volume_ratio:.1f}x avg")
-            elif volume_ratio > 1.2:
-                confidence += 5
+            price_change = (current - price[-5]) / price[-5] * 100 if len(price) > 5 else 0
+            
+            if volume_ratio > 1.8:
+                if signal['type'].startswith('BUY'):
+                    if price_change < -2:
+                        confidence -= 25
+                        filters_triggered.append(f"⚠️ High volume {volume_ratio:.1f}x on down move")
+                        if confidence < 30:
+                            skip_signal = True
+                    else:
+                        confidence += 12
+                        filters_triggered.append(f"🔥 Volume {volume_ratio:.1f}x avg")
+                elif signal['type'].startswith('SELL'):
+                    if price_change > 2:
+                        confidence -= 25
+                        filters_triggered.append(f"⚠️ High volume {volume_ratio:.1f}x on up move")
+                        if confidence < 30:
+                            skip_signal = True
+                    else:
+                        confidence += 12
+                        filters_triggered.append(f"🔥 Volume {volume_ratio:.1f}x avg")
+            elif volume_ratio > 1.3:
+                confidence += 6
                 filters_triggered.append(f"📈 Volume {volume_ratio:.1f}x avg")
             else:
-                filters_triggered.append(f"📉 Volume {volume_ratio:.1f}x avg (below threshold)")
+                filters_triggered.append(f"📉 Volume {volume_ratio:.1f}x avg")
         
-        # FILTER 2: MA200 Trend
-        if len(price) > MA_PERIOD:
-            ma_200 = np.mean(price[-MA_PERIOD:])
+        # FILTER 2: MA Trend Alignment
+        if len(price) > ma_period:
+            ma = np.mean(price[-ma_period:])
             
             if signal['type'].startswith('BUY'):
-                if current > ma_200:
+                if current > ma:
                     confidence += 8
-                    filters_triggered.append(f"✅ Above MA200 (${ma_200:.2f})")
+                    filters_triggered.append(f"✅ Above MA{ma_period} (${ma:.2f})")
                 else:
-                    confidence -= 5
-                    filters_triggered.append(f"⚠️ Below MA200 (${ma_200:.2f})")
+                    confidence -= 15
+                    filters_triggered.append(f"⚠️ Below MA{ma_period} (${ma:.2f})")
+                    if current < ma * 0.98:
+                        confidence -= 10
+                        filters_triggered.append(f"⚠️ Far below MA{ma_period}")
             
             elif signal['type'].startswith('SELL'):
-                if current < ma_200:
+                if current < ma:
                     confidence += 8
-                    filters_triggered.append(f"✅ Below MA200 (${ma_200:.2f})")
+                    filters_triggered.append(f"✅ Below MA{ma_period} (${ma:.2f})")
                 else:
-                    confidence -= 5
-                    filters_triggered.append(f"⚠️ Above MA200 (${ma_200:.2f})")
+                    confidence -= 15
+                    filters_triggered.append(f"⚠️ Above MA{ma_period} (${ma:.2f})")
+                    if current > ma * 1.02:
+                        confidence -= 10
+                        filters_triggered.append(f"⚠️ Far above MA{ma_period}")
         
-        # FILTER 3: 15m Confirmation
-        confirms_15m, rsi_15m = check_timeframe_confirmation(symbol, TIMEFRAME_15M)
-        if confirms_15m is not None:
-            if confirms_15m:
-                confidence += 12
-                filters_triggered.append(f"✅ 15m confirms (RSI {rsi_15m})")
+        # FILTER 3: Timeframe Confirmation
+        confirm_tf = params['confirmation_timeframe']
+        confirms, rsi_confirm = check_timeframe_confirmation(
+            symbol, confirm_tf, rsi_period, rsi_threshold=35
+        )
+        if confirms is not None:
+            if confirms:
+                confidence += 15
+                filters_triggered.append(f"✅ {confirm_tf} confirms (RSI {rsi_confirm})")
             else:
-                confidence -= 3
-                filters_triggered.append(f"⚠️ 15m not confirming (RSI {rsi_15m})")
+                confidence -= 15
+                filters_triggered.append(f"⚠️ {confirm_tf} not confirming (RSI {rsi_confirm})")
+                if signal['type'].startswith('BUY') and rsi_confirm > 45:
+                    confidence -= 10
+                elif signal['type'].startswith('SELL') and rsi_confirm < 55:
+                    confidence -= 10
+        
+        # FILTER 4: RSI Divergence Check
+        if len(price) > 20:
+            if signal['type'].startswith('BUY') and rsi_val < 30 and current > upper:
+                confidence -= 20
+                filters_triggered.append("⚠️ RSI/Price divergence")
+            
+            if signal['type'].startswith('SELL') and rsi_val > 70 and current < lower:
+                confidence -= 20
+                filters_triggered.append("⚠️ RSI/Price divergence")
+        
+        # FILTER 5: Price Change Velocity
+        if len(price) > 10:
+            recent_change = (current / price[-10] - 1) * 100
+            if signal['type'].startswith('BUY') and recent_change < -10:
+                confidence -= 15
+                filters_triggered.append(f"⚠️ Sharp drop {recent_change:.1f}%")
+            elif signal['type'].startswith('SELL') and recent_change > 10:
+                confidence -= 15
+                filters_triggered.append(f"⚠️ Sharp rise {recent_change:.1f}%")
         
         confidence = max(0, min(100, confidence))
         
-        enhanced_signals.append({
-            'type': signal['type'],
-            'confidence': round(confidence, 1),
-            'description': signal['description'],
-            'filters': filters_triggered,
-            'base_confidence': signal['base_confidence']
-        })
+        if confidence < 50:
+            skip_signal = True
+        
+        if not skip_signal:
+            enhanced_signals.append({
+                'type': signal['type'],
+                'confidence': round(confidence, 1),
+                'description': signal['description'],
+                'filters': filters_triggered,
+                'base_confidence': signal['base_confidence']
+            })
     
     enhanced_signals.sort(key=lambda x: x['confidence'], reverse=True)
     return enhanced_signals
 
 # ============================================
-# MAIN SCAN FUNCTION WITH POSITION SIZING
+# MAIN SCAN FUNCTION
 # ============================================
 
-def scan_with_signals():
+def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positions):
+    params = get_timeframe_params(timeframe)
     results = []
     
-    print(f"\n{'='*100}")
-    print(f"ENHANCED SCAN: {TIMEFRAME} | {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"Account: ${ACCOUNT_SIZE:,} | Max Risk: {MAX_RISK_PER_TRADE*100:.0f}% per trade | Max Positions: {MAX_POSITIONS}")
-    print(f"Filters: Volume ✓ | MA200 ✓ | 15m Confirmation ✓")
-    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures (XAU/XAG)")
-    print(f"{'='*100}\n")
+    # Override with CLI args if provided
+    risk_percent = risk_percent
+    max_positions = max_positions
+    
+    print(f"\n{'='*110}")
+    print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"{'='*110}")
+    print(f"Account: ${account_size:,} | Risk: {risk_percent*100:.1f}% per trade | Max Positions: {max_positions}")
+    print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
+    print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
+    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures")
+    print(f"{'='*110}\n")
     
     for symbol in SYMBOLS:
         try:
-            df = fetch_data(symbol, TIMEFRAME, LOOKBACK+50)
-            if df is None or len(df) < 500:
-                print(f"⚠️ {symbol}: Insufficient data... Continuing scan 🔍")
+            df = fetch_data(symbol, timeframe, params['lookback'] + 50)
+            if df is None or len(df) < params['lookback']:
                 continue
             
             close = df['close'].values
             volume = df['volume'].values
             
-            mid, upper, lower = nadaraya_watson_envelope(close, BANDWIDTH, MULTIPLIER)
+            mid, upper, lower = nadaraya_watson_envelope(
+                close, params['bandwidth'], params['multiplier'], params['lookback']
+            )
             
             if mid is None:
                 continue
             
-            rsi_val = rsi(close[-RSI_PERIOD-50:], RSI_PERIOD)
+            rsi_val = rsi(close[-params['rsi_period']-30:], params['rsi_period'])
             current_price = close[-1]
             
-            signals = detect_signals(close, volume, rsi_val, lower, upper, mid, symbol)
+            signals = detect_signals(
+                close, volume, rsi_val, lower, upper, mid, symbol, params
+            )
             
             if signals:
                 best = signals[0]
                 
-                # Calculate position size and entry/exit
                 entry_exit = calculate_entry_exit(
                     current_price, lower, upper, mid,
-                    best['type'], best['confidence'], rsi_val
+                    best['type'], best['confidence'], rsi_val, params
                 )
                 
                 position_size = calculate_position_size(
-                    current_price, entry_exit['stop_loss'], best['confidence']
+                    current_price, entry_exit['stop_loss'], best['confidence'],
+                    account_size, risk_percent
                 )
                 
-                # Price position
                 position = "Inside"
                 if current_price < lower:
                     position = "Below Lower"
@@ -453,43 +644,54 @@ def scan_with_signals():
                     'stop_loss': entry_exit['stop_loss'],
                     'tp1': entry_exit['take_profit_1'],
                     'tp2': entry_exit['take_profit_2'],
+                    'tp3': entry_exit['take_profit_3'],
+                    'target_1_gain': entry_exit['target_1_gain'],
+                    'target_2_gain': entry_exit['target_2_gain'],
+                    'target_3_gain': entry_exit['target_3_gain'],
                     'risk_reward_1': entry_exit['risk_reward_1'],
                     'risk_reward_2': entry_exit['risk_reward_2'],
+                    'risk_reward_3': entry_exit['risk_reward_3'],
                     'position_size': position_size['size'],
                     'position_value': position_size['value'],
                     'risk_amount': position_size['risk_amount'],
                     'risk_percent': position_size['risk_percent']
                 })
             else:
-                position = "Inside"
-                if current_price < lower:
-                    position = "Below Lower"
-                elif current_price > upper:
-                    position = "Above Upper"
-                
-                results.append({
-                    'symbol': symbol,
-                    'price': current_price,
-                    'signal_type': 'NEUTRAL',
-                    'confidence': 0,
-                    'description': 'No signal',
-                    'filters': 'N/A',
-                    'rsi': round(rsi_val, 2),
-                    'lower': round(lower, 2),
-                    'upper': round(upper, 2),
-                    'mid': round(mid, 2),
-                    'position': position,
-                    'entry': None,
-                    'stop_loss': None,
-                    'tp1': None,
-                    'tp2': None,
-                    'risk_reward_1': None,
-                    'risk_reward_2': None,
-                    'position_size': None,
-                    'position_value': None,
-                    'risk_amount': None,
-                    'risk_percent': None
-                })
+                if verbose:
+                    position = "Inside"
+                    if current_price < lower:
+                        position = "Below Lower"
+                    elif current_price > upper:
+                        position = "Above Upper"
+                    
+                    results.append({
+                        'symbol': symbol,
+                        'price': current_price,
+                        'signal_type': 'NEUTRAL',
+                        'confidence': 0,
+                        'description': 'No signal',
+                        'filters': 'N/A',
+                        'rsi': round(rsi_val, 2),
+                        'lower': round(lower, 2),
+                        'upper': round(upper, 2),
+                        'mid': round(mid, 2),
+                        'position': position,
+                        'entry': None,
+                        'stop_loss': None,
+                        'tp1': None,
+                        'tp2': None,
+                        'tp3': None,
+                        'target_1_gain': None,
+                        'target_2_gain': None,
+                        'target_3_gain': None,
+                        'risk_reward_1': None,
+                        'risk_reward_2': None,
+                        'risk_reward_3': None,
+                        'position_size': None,
+                        'position_value': None,
+                        'risk_amount': None,
+                        'risk_percent': None
+                    })
                 
         except Exception as e:
             print(f"❌ {symbol}: Error - {str(e)[:80]}")
@@ -503,69 +705,126 @@ def scan_with_signals():
     
     df_results = df_results.sort_values('confidence', ascending=False)
     
-    # DISPLAY - Signal Summary
-    print(f"{'SYMBOL':<14} {'PRICE':<10} {'SIGNAL':<18} {'CONF':<6} {'RSI':<8} {'POSITION':<15} {'FILTERS'}")
-    print("-"*110)
-    
-    for _, row in df_results.iterrows():
-        emoji = "🔴" if row['signal_type'].startswith('SELL') else "🟢" if row['signal_type'].startswith('BUY') else "⚪"
-        conf_display = f"{row['confidence']}%" if row['confidence'] > 0 else "---"
-        filters_display = row['filters'][:40] + '...' if len(row['filters']) > 40 else row['filters']
-        symbol_display = row['symbol'][:14]
-        print(f"{symbol_display:<14} ${row['price']:<9.2f} {emoji} {row['signal_type']:<16} {conf_display:<5}  {row['rsi']:<6}  {row['position']:<15} {filters_display}")
-    
-    # DISPLAY - Detailed Trading Plan for Signals
+    # DISPLAY - Signal Summary (always show signals)
     signals_df = df_results[df_results['signal_type'].str.startswith(('BUY', 'SELL'))]
     
     if len(signals_df) > 0:
-        print(f"\n{'='*100}")
-        print("📊 TRADING PLANS FOR SIGNALS")
-        print(f"{'='*100}\n")
+        print(f"{'SYMBOL':<14} {'PRICE':<10} {'SIGNAL':<18} {'CONF':<6} {'RSI':<8} {'POSITION':<15} {'FILTERS'}")
+        print("-"*110)
+        
+        for _, row in signals_df.iterrows():
+            emoji = "🔴" if row['signal_type'].startswith('SELL') else "🟢"
+            conf_display = f"{row['confidence']}%"
+            filters_display = row['filters'][:40] + '...' if len(row['filters']) > 40 else row['filters']
+            symbol_display = row['symbol'][:14]
+            print(f"{symbol_display:<14} ${row['price']:<9.2f} {emoji} {row['signal_type']:<16} {conf_display:<5}  {row['rsi']:<6}  {row['position']:<15} {filters_display}")
+        
+        # DISPLAY - Detailed Trading Plans
+        print(f"\n{'='*110}")
+        print("📊 TRADING PLANS (3 Targets)")
+        print(f"{'='*110}\n")
         
         for _, row in signals_df.iterrows():
             print(f"🎯 {row['symbol']} - {row['signal_type']} (Confidence: {row['confidence']}%)")
             print(f"   📍 Entry: ${row['entry']:.4f}")
             print(f"   🛑 Stop Loss: ${row['stop_loss']:.4f} (Risk: ${row['risk_amount']:.2f} | {row['risk_percent']:.2f}% of account)")
-            print(f"   🎯 Take Profit 1: ${row['tp1']:.4f} (+{row.get('target_1_gain', 0):.1f}%) | R:R {row['risk_reward_1']:.2f}")
-            print(f"   🎯 Take Profit 2: ${row['tp2']:.4f} (+{row.get('target_2_gain', 0):.1f}%) | R:R {row['risk_reward_2']:.2f}")
+            print(f"   🎯 TP1: ${row['tp1']:.4f} (+{row['target_1_gain']:.1f}%) | R:R {row['risk_reward_1']:.2f}")
+            print(f"   🎯 TP2: ${row['tp2']:.4f} (+{row['target_2_gain']:.1f}%) | R:R {row['risk_reward_2']:.2f}")
+            print(f"   🎯 TP3: ${row['tp3']:.4f} (+{row['target_3_gain']:.1f}%) | R:R {row['risk_reward_3']:.2f}")
             print(f"   📊 Position Size: {row['position_size']:.4f} units (${row['position_value']:.2f})")
             print(f"   🔍 Filters: {row['filters']}")
             print()
+    else:
+        print("📭 No signals detected in this scan.")
     
     # DISPLAY - Summary
     buy_signals = df_results[df_results['signal_type'].str.startswith('BUY')]
     sell_signals = df_results[df_results['signal_type'].str.startswith('SELL')]
     neutral = df_results[df_results['signal_type'] == 'NEUTRAL']
     
-    print(f"\n{'='*100}")
+    print(f"\n{'='*110}")
     print(f"SUMMARY: {len(buy_signals)} BUY | {len(sell_signals)} SELL | {len(neutral)} NEUTRAL | {len(df_results)} TOTAL")
     
     if len(buy_signals) > 0:
-        print("\n🟢 TOP BUY SIGNALS (with trading plan):")
-        for _, row in buy_signals.head(2).iterrows():
+        print("\n🟢 TOP BUY SIGNALS:")
+        for _, row in buy_signals.head(3).iterrows():
             print(f"   {row['symbol']}: {row['description']}")
-            print(f"      Entry: ${row['entry']:.4f} | Stop: ${row['stop_loss']:.4f} | TP1: ${row['tp1']:.4f} | TP2: ${row['tp2']:.4f}")
-            print(f"      Size: {row['position_size']:.4f} units (${row['position_value']:.2f}) | Risk: ${row['risk_amount']:.2f}")
+            print(f"      Entry: ${row['entry']:.4f} | Stop: ${row['stop_loss']:.4f}")
+            print(f"      TP1: ${row['tp1']:.4f} | TP2: ${row['tp2']:.4f} | TP3: ${row['tp3']:.4f}")
     
     if len(sell_signals) > 0:
-        print("\n🔴 TOP SELL SIGNALS (with trading plan):")
-        for _, row in sell_signals.head(2).iterrows():
+        print("\n🔴 TOP SELL SIGNALS:")
+        for _, row in sell_signals.head(3).iterrows():
             print(f"   {row['symbol']}: {row['description']}")
-            print(f"      Entry: ${row['entry']:.4f} | Stop: ${row['stop_loss']:.4f} | TP1: ${row['tp1']:.4f} | TP2: ${row['tp2']:.4f}")
-            print(f"      Size: {row['position_size']:.4f} units (${row['position_value']:.2f}) | Risk: ${row['risk_amount']:.2f}")
+            print(f"      Entry: ${row['entry']:.4f} | Stop: ${row['stop_loss']:.4f}")
+            print(f"      TP1: ${row['tp1']:.4f} | TP2: ${row['tp2']:.4f} | TP3: ${row['tp3']:.4f}")
     
-    print(f"{'='*100}")
+    print(f"{'='*110}")
     return df_results
 
 # ============================================
 # RUN
 # ============================================
-if __name__ == "__main__":
-    print("🔍 Starting Enhanced Multi-Asset Scanner with Position Sizing...")
-    print(f"Scanning {len(SYMBOLS)} symbols on {TIMEFRAME} timeframe\n")
+
+def main():
+    args = parse_args()
+    
+    # List timeframes
+    if args.list_timeframes:
+        print("\n📊 Available Timeframes:")
+        print("  ⏱️ 1m   - Scalping (very active)")
+        print("  ⏱️ 5m   - Scalping")
+        print("  ⏱️ 15m  - Day trading")
+        print("  ⏱️ 30m  - Day/Swing trading")
+        print("  ⏱️ 1h   - Swing trading (default)")
+        print("  ⏱️ 2h   - Swing trading")
+        print("  ⏱️ 4h   - Swing/Position trading")
+        print("  ⏱️ 6h   - Position trading")
+        print("  ⏱️ 12h  - Position trading")
+        print("  ⏱️ 1d   - Long-term position trading")
+        print("\n💡 Recommended scan frequencies:")
+        print("  1m-15m: Every 5-15 minutes")
+        print("  30m-1h: Every 30-60 minutes")
+        print("  2h-4h:  Every 2-4 hours")
+        print("  6h-1d:  Every 6-24 hours")
+        sys.exit(0)
+    
+    # Validate timeframe
+    valid_timeframes = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d']
+    if args.timeframe not in valid_timeframes:
+        print(f"❌ Invalid timeframe: {args.timeframe}")
+        print(f"   Valid options: {', '.join(valid_timeframes)}")
+        print(f"   Use --list-timeframes for more details")
+        sys.exit(1)
+    
+    print("🔍 Starting Multi-Asset Scanner...")
+    print(f"   Timeframe: {args.timeframe}")
+    print(f"   Account: ${args.account_size:,}")
+    print(f"   Risk per trade: {args.risk*100:.1f}%")
+    print(f"   Max positions: {args.max_positions}")
+    if args.verbose:
+        print("   Verbose mode: ON (showing all symbols)")
     
     start_time = time.time()
-    results = scan_with_signals()
+    results = scan_with_signals(
+        args.timeframe,
+        args.verbose,
+        args.account_size,
+        args.risk,
+        args.max_positions
+    )
     elapsed = time.time() - start_time
     
     print(f"\n⏱️ Scan completed in {elapsed:.2f} seconds")
+    
+    if args.timeframe in ['1m', '5m', '15m']:
+        print(f"\n💡 Recommended scan frequency: Every {args.timeframe} (or more frequently for scalping)")
+    elif args.timeframe in ['30m', '1h']:
+        print(f"\n💡 Recommended scan frequency: Every 30-60 minutes")
+    elif args.timeframe in ['2h', '4h']:
+        print(f"\n💡 Recommended scan frequency: Every {args.timeframe}")
+    else:
+        print(f"\n💡 Recommended scan frequency: Every {args.timeframe} or daily")
+
+if __name__ == "__main__":
+    main()
