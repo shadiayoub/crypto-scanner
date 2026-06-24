@@ -20,6 +20,8 @@ import time
 import warnings
 import argparse
 import sys
+import json
+import os
 warnings.filterwarnings('ignore')
 
 # ============================================
@@ -236,21 +238,30 @@ def rsi(price, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def fetch_data(symbol, timeframe, limit=550):
-    try:
-        is_futures = ':' in symbol
-        
+# Cached exchange instances so load_markets() runs once per process,
+# not once per fetch_data() call (~4s -> ~0.27s per fetch).
+_EXCHANGES = {}
+
+def get_exchange(is_futures):
+    key = 'futures' if is_futures else 'spot'
+    if key not in _EXCHANGES:
         if is_futures:
-            exchange = ccxt.binanceusdm({
+            _EXCHANGES[key] = ccxt.binanceusdm({
                 'enableRateLimit': True,
                 'options': {'defaultType': 'future'}
             })
         else:
-            exchange = ccxt.binance({
+            _EXCHANGES[key] = ccxt.binance({
                 'enableRateLimit': True,
                 'options': {'defaultType': 'spot'}
             })
-        
+    return _EXCHANGES[key]
+
+def fetch_data(symbol, timeframe, limit=550):
+    try:
+        is_futures = ':' in symbol
+        exchange = get_exchange(is_futures)
+
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         return df
@@ -299,6 +310,52 @@ def calculate_position_size(price, stop_loss, confidence, account_size, risk_per
         'risk_percent': round((adjusted_risk / account_size) * 100, 2),
         'confidence_multiplier': round(confidence_multiplier, 2)
     }
+
+# ============================================
+# FEED WRITER
+# ============================================
+
+def write_to_feed(signals, timeframe, feed_path="data/rsi_alerts.json"):
+    """Append detected signals to the rsi_alerts.json file."""
+    feed_entries = []
+    for sig in signals:
+        # Normalize confidence from 0-100 to 0-6 scale
+        conf = round(sig["confidence"] / 100 * 6, 1)
+
+        # Map direction
+        direction = "buy" if "BUY" in sig["signal_type"] else "sell"
+
+        entry = {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": sig["symbol"],
+            "timeframe": timeframe,
+            "direction": direction,
+            "rsi": sig["rsi"],
+            "price": sig["entry"],
+            "pivot_level": None,
+            "pivot_distance": None,
+            "confidence": conf,
+            "sl": sig["stop_loss"],
+            "tp": sig["tp1"],  # Use TP1 as primary target
+            "signal_source": "signal_scanner"
+        }
+        feed_entries.append(entry)
+
+    # Read existing feed, prepend new entries
+    os.makedirs(os.path.dirname(feed_path), exist_ok=True)
+    existing = []
+    if os.path.exists(feed_path):
+        with open(feed_path, "r") as f:
+            try:
+                existing = json.load(f)
+            except json.JSONDecodeError:
+                existing = []
+
+    combined = (feed_entries + existing)[:500]
+    with open(feed_path, "w") as f:
+        json.dump(combined, f, indent=2)
+
+    print(f"Wrote {len(feed_entries)} signals to {feed_path}")
 
 # ============================================
 # SUGGESTED ENTRY/EXIT PRICES (3 TARGETS)
@@ -827,6 +884,10 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             print(f"      TP1: ${row['tp1']:.4f} | TP2: ${row['tp2']:.4f} | TP3: ${row['tp3']:.4f}")
     
     print(f"{'='*110}")
+
+    # Write detected signals to the feed
+    write_to_feed(signals_df.to_dict('records'), timeframe)
+
     return df_results
 
 # ============================================

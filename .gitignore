@@ -1,3 +1,6 @@
 old/
 short-tf-scanner.py
 bkp.scanner.py
+logs/
+data/
+__pycache__/
