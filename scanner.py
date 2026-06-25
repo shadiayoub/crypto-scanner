@@ -2,6 +2,7 @@
 """
 Multi-Asset Scanner with Nadaraya-Watson Envelope
 Supports both long-term and short-term timeframes via command-line arguments
+Includes Bitcoin Market Filter for trend reversal detection
 
 Usage:
     python scanner.py                    # Default: 1h timeframe
@@ -39,6 +40,7 @@ Examples:
   python scanner.py -tf 4h             # 4-hour timeframe
   python scanner.py -tf 1h -v          # Verbose mode with all filters
   python scanner.py --list-timeframes  # Show all available timeframes
+  python scanner.py --no-btc-filter    # Disable Bitcoin market filter
         """
     )
     
@@ -80,6 +82,19 @@ Examples:
         type=int,
         default=3,
         help='Maximum concurrent positions (default: 3)'
+    )
+    
+    parser.add_argument(
+        '--no-btc-filter',
+        action='store_true',
+        help='Disable Bitcoin market filter (use at your own risk)'
+    )
+    
+    parser.add_argument(
+        '--btc-threshold',
+        type=float,
+        default=1.5,
+        help='BTC price change threshold to trigger filter reversal (default: 1.5%%)'
     )
     
     return parser.parse_args()
@@ -217,6 +232,102 @@ def get_timeframe_params(timeframe, is_metal=False):
     return params
 
 # ============================================
+# BITCOIN MARKET FILTER
+# ============================================
+
+def get_btc_market_state(timeframe, lookback=10, threshold=1.5):
+    """
+    Analyze Bitcoin's current market state
+    Returns: 'strong_bullish', 'bullish', 'neutral', 'bearish', 'strong_bearish'
+    """
+    try:
+        # Fetch BTC data
+        df = fetch_data('BTC/USDT', timeframe, limit=lookback + 5)
+        if df is None or len(df) < lookback:
+            return 'neutral', 0.0
+        
+        close = df['close'].values
+        current_price = close[-1]
+        price_5_ago = close[-5] if len(close) >= 5 else current_price
+        price_10_ago = close[-10] if len(close) >= 10 else current_price
+        
+        # Calculate changes
+        change_5 = ((current_price - price_5_ago) / price_5_ago) * 100
+        change_10 = ((current_price - price_10_ago) / price_10_ago) * 100
+        
+        # Use average of 5 and 10 bar changes
+        avg_change = (change_5 + change_10) / 2
+        
+        # Determine state
+        if avg_change > threshold * 2:
+            state = 'strong_bullish'
+        elif avg_change > threshold:
+            state = 'bullish'
+        elif avg_change < -threshold * 2:
+            state = 'strong_bearish'
+        elif avg_change < -threshold:
+            state = 'bearish'
+        else:
+            state = 'neutral'
+        
+        return state, avg_change
+        
+    except Exception as e:
+        print(f"⚠️ BTC market filter error: {str(e)[:60]}")
+        return 'neutral', 0.0
+
+def apply_btc_filter(signal_type, confidence, btc_state, btc_change):
+    """
+    Apply Bitcoin market filter to reverse or adjust signals
+    Returns: (new_signal_type, confidence_adjustment, filter_message)
+    """
+    
+    # If neutral, no change
+    if btc_state == 'neutral':
+        return signal_type, 0, f"BTC neutral ({btc_change:.1f}%)"
+    
+    # Define reversal logic
+    reversal_map = {
+        'BUY_OVERSOLD': 'SELL_OVERBOUGHT',
+        'SELL_OVERBOUGHT': 'BUY_OVERSOLD',
+        'BUY_CROSS': 'SELL_CROSS',
+        'SELL_CROSS': 'BUY_CROSS',
+        'EXTREME_OVERSOLD': 'EXTREME_OVERBOUGHT',
+        'EXTREME_OVERBOUGHT': 'EXTREME_OVERSOLD'
+    }
+    
+    # Strong signals get reversed
+    if btc_state in ['strong_bullish', 'strong_bearish']:
+        # Reverse the signal
+        new_signal = reversal_map.get(signal_type, signal_type)
+        
+        # Add confidence penalty for reversal
+        confidence_adj = -15  # Reversals are less confident
+        
+        message = f"⚠️ BTC {btc_state} ({btc_change:.1f}%) - SIGNAL REVERSED: {signal_type} → {new_signal}"
+        return new_signal, confidence_adj, message
+    
+    # Mild signals get adjusted but not fully reversed
+    elif btc_state in ['bullish', 'bearish']:
+        if signal_type.startswith('BUY') and btc_state == 'bearish':
+            # Downgrade BUY signals in bearish market
+            confidence_adj = -10
+            message = f"⚠️ BTC bearish ({btc_change:.1f}%) - BUY signals downgraded"
+            return signal_type, confidence_adj, message
+        elif signal_type.startswith('SELL') and btc_state == 'bullish':
+            # Downgrade SELL signals in bullish market
+            confidence_adj = -10
+            message = f"⚠️ BTC bullish ({btc_change:.1f}%) - SELL signals downgraded"
+            return signal_type, confidence_adj, message
+        else:
+            # Signal aligns with BTC trend
+            confidence_adj = 5
+            message = f"✅ BTC {btc_state} ({btc_change:.1f}%) - signal aligns"
+            return signal_type, confidence_adj, message
+    
+    return signal_type, 0, f"BTC neutral ({btc_change:.1f}%)"
+
+# ============================================
 # INDICATOR FUNCTIONS
 # ============================================
 
@@ -270,10 +381,7 @@ def fetch_data(symbol, timeframe, limit=550):
         
         # For metals, we need to fetch more data to get enough for lookback
         if is_metal:
-            # Binance Futures only returns ~50 bars, so we need to fetch multiple times
-            # Or use a smaller limit - we'll handle this in the scan function
-            limit = 100  # Request more, but Binance will still only return ~50
-            print(f"🔍 Fetching metal: {symbol} on {timeframe} (limit={limit})")
+            limit = 100
         
         if is_futures:
             exchange = ccxt.binanceusdm({
@@ -444,7 +552,7 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
 # ENHANCED SIGNAL DETECTION WITH HIGHER TIMEFRAME OVERRULE
 # ============================================
 
-def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is_metal=False):
+def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is_metal=False, btc_state='neutral', btc_change=0):
     current = price[-1]
     prev = price[-2]
     signals = []
@@ -656,6 +764,24 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
                     filters_triggered.append(f"⚠️ 1h RSI {rsi_1h} (overbought) - reduce confidence")
         
         # ============================================
+        # FILTER 7: BITCOIN MARKET FILTER
+        # ============================================
+        # Apply BTC filter (only for non-BTC symbols)
+        if symbol != 'BTC/USDT' and btc_state != 'neutral':
+            new_signal, btc_confidence_adj, btc_message = apply_btc_filter(
+                signal['type'], confidence, btc_state, btc_change
+            )
+            
+            # Update signal type and confidence
+            if new_signal != signal['type']:
+                signal['type'] = new_signal
+                signal['description'] = f"{signal['description']} (REVERSED by BTC filter)"
+                filters_triggered.append(btc_message)
+            
+            confidence += btc_confidence_adj
+            filters_triggered.append(f"BTC filter: {btc_message}")
+        
+        # ============================================
         # FINAL CONFIDENCE CALCULATION
         # ============================================
         confidence = max(0, min(100, confidence))
@@ -680,7 +806,7 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
 # MAIN SCAN FUNCTION
 # ============================================
 
-def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positions):
+def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positions, use_btc_filter=True, btc_threshold=1.5):
     results = []
     
     print(f"\n{'='*110}")
@@ -688,11 +814,25 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"{'='*110}")
     print(f"Account: ${account_size:,} | Risk: {risk_percent*100:.1f}% per trade | Max Positions: {max_positions}")
     print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures (XAU/XAG)")
+    if use_btc_filter:
+        print(f"🐂 Bitcoin Market Filter: ENABLED (threshold: {btc_threshold}%)")
+        # Check BTC state for display
+        btc_state, btc_change = get_btc_market_state(timeframe, threshold=btc_threshold)
+        print(f"   BTC Market State: {btc_state.upper()} ({btc_change:.2f}%)")
+    else:
+        print(f"🐂 Bitcoin Market Filter: DISABLED")
     print(f"{'='*110}\n")
+    
+    # Get BTC market state once for the entire scan
+    btc_state = 'neutral'
+    btc_change = 0.0
+    if use_btc_filter:
+        btc_state, btc_change = get_btc_market_state(timeframe, threshold=btc_threshold)
     
     for symbol in SYMBOLS:
         try:
             is_metal = symbol in METAL_SYMBOLS
+            is_btc = symbol == 'BTC/USDT'
             
             # Get parameters (different for metals)
             params = get_timeframe_params(timeframe, is_metal)
@@ -703,7 +843,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             
             df = fetch_data(symbol, timeframe, limit=fetch_limit)
             
-            if df is None or len(df) < max(30, lookback_needed * 0.6):  # Allow 60% of lookback for metals
+            if df is None or len(df) < max(30, lookback_needed * 0.6):
                 if is_metal:
                     print(f"⚠️ {symbol}: Only {len(df) if df is not None else 0} bars (needs ~{lookback_needed * 0.6:.0f} for metal)")
                 continue
@@ -723,8 +863,17 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             rsi_val = rsi(close[-params['rsi_period']-30:], params['rsi_period'])
             current_price = close[-1]
             
+            # For BTC, we don't apply BTC filter to itself
+            if is_btc:
+                btc_state_for_symbol = 'neutral'
+                btc_change_for_symbol = 0.0
+            else:
+                btc_state_for_symbol = btc_state
+                btc_change_for_symbol = btc_change
+            
             signals = detect_signals(
-                close, volume, rsi_val, lower, upper, mid, symbol, params, is_metal
+                close, volume, rsi_val, lower, upper, mid, symbol, params, is_metal,
+                btc_state_for_symbol, btc_change_for_symbol
             )
             
             if signals:
@@ -923,6 +1072,10 @@ def main():
     print(f"   Max positions: {args.max_positions}")
     if args.verbose:
         print("   Verbose mode: ON (showing all symbols)")
+    if args.no_btc_filter:
+        print("   Bitcoin Market Filter: DISABLED")
+    else:
+        print(f"   Bitcoin Market Filter: ENABLED (threshold: {args.btc_threshold}%)")
     print(f"   Metals: XAU/XAG with reduced lookback ({get_timeframe_params(args.timeframe, True)['lookback']} bars)")
     
     start_time = time.time()
@@ -931,7 +1084,9 @@ def main():
         args.verbose,
         args.account_size,
         args.risk,
-        args.max_positions
+        args.max_positions,
+        use_btc_filter=not args.no_btc_filter,
+        btc_threshold=args.btc_threshold
     )
     elapsed = time.time() - start_time
     
