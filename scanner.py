@@ -811,8 +811,11 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
         # ============================================
         # FILTER 7: BITCOIN MARKET FILTER
         # ============================================
-        # Apply BTC filter (only for non-BTC symbols)
-        if symbol != 'BTC/USDT' and btc_state != 'neutral':
+        # Apply BTC filter (only for non-BTC, non-metal symbols)
+        # Metals (XAU/XAG) are NOT correlated with BTC
+        if (symbol != 'BTC/USDT' and 
+            symbol not in METAL_SYMBOLS and 
+            btc_state != 'neutral'):
             new_signal, btc_confidence_adj, btc_message = apply_btc_filter_higher_tf(
                 signal['type'], confidence, btc_state, btc_change, btc_tf
             )
@@ -825,6 +828,9 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
             
             confidence += btc_confidence_adj
             filters_triggered.append(f"BTC filter: {btc_message}")
+        elif symbol in METAL_SYMBOLS:
+            # Metals are independent of BTC - skip BTC filter
+            filters_triggered.append("💰 Metal: BTC filter bypassed (independent asset)")
         
         # ============================================
         # FINAL CONFIDENCE CALCULATION
@@ -861,10 +867,10 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures (XAU/XAG)")
     if use_btc_filter:
         print(f"🐂 Bitcoin Market Filter: ENABLED (threshold: {btc_threshold}%)")
+        print(f"   ⚠️ Metals (XAU/XAG) EXCLUDED from BTC filter (independent assets)")
         # Check BTC state for display
         btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=btc_threshold)
         print(f"   BTC Market State: {btc_state.upper()} ({btc_change:.2f}%) on {btc_tf}")
-
     else:
         print(f"🐂 Bitcoin Market Filter: DISABLED")
     print(f"{'='*110}\n")
