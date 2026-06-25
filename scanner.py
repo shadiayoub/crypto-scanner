@@ -20,8 +20,6 @@ import time
 import warnings
 import argparse
 import sys
-import json
-import os
 warnings.filterwarnings('ignore')
 
 # ============================================
@@ -112,6 +110,9 @@ FUTURES_SYMBOLS = [
     'XAG/USDT:USDT'   # Silver perpetual
 ]
 
+# Define metals for special handling
+METAL_SYMBOLS = ['XAU/USDT:USDT', 'XAG/USDT:USDT']
+
 # Combine all symbols
 SYMBOLS = SPOT_SYMBOLS + FUTURES_SYMBOLS
 
@@ -119,76 +120,99 @@ SYMBOLS = SPOT_SYMBOLS + FUTURES_SYMBOLS
 # TIMEFRAME-SPECIFIC PARAMETERS
 # ============================================
 
-def get_timeframe_params(timeframe):
+def get_timeframe_params(timeframe, is_metal=False):
     """
     Returns optimized parameters for each timeframe
+    For metals, uses reduced lookback due to limited historical data
     """
-    params = {
-        'lookback': 500,
-        'bandwidth': 6.0,
-        'multiplier': 3.0,
-        'rsi_period': 14,
-        'ma_period': 200,
-        'confirmation_timeframe': '15m',
-        'max_positions': 3,
-        'risk_per_trade': 0.02,
-        'stop_distance': 0.025,  # 2.5%
-        'target_1_pct': 0.03,    # 3%
-        'target_2_pct': 0.05,    # 5%
-        'target_3_pct': 0.07,    # 7%
-        'filters': ['volume', 'ma', 'confirmation']
-    }
-    
-    # Short-term timeframes (scalping/day trading)
-    if timeframe in ['1m', '5m', '15m']:
-        params.update({
-            'lookback': 200,
-            'bandwidth': 3.5,
-            'multiplier': 2.0,
-            'rsi_period': 8,
-            'ma_period': 50,
+    # Base parameters
+    if is_metal:
+        # Metals have limited data (only ~50 bars on Binance Futures)
+        params = {
+            'lookback': 40,  # Much smaller for metals
+            'bandwidth': 4.0,
+            'multiplier': 2.5,
+            'rsi_period': 10,
+            'ma_period': 30,
             'confirmation_timeframe': '1h',
-            'max_positions': 8,
-            'risk_per_trade': 0.01,
-            'stop_distance': 0.015,  # 1.5%
-            'target_1_pct': 0.015,   # 1.5%
-            'target_2_pct': 0.025,   # 2.5%
-            'target_3_pct': 0.04,    # 4%
-        })
-    
-    # Medium-term timeframes (day trading)
-    elif timeframe in ['30m', '1h']:
-        params.update({
-            'lookback': 300 if timeframe == '30m' else 500,
-            'bandwidth': 4.5 if timeframe == '30m' else 6.0,
-            'multiplier': 2.5 if timeframe == '30m' else 3.0,
-            'rsi_period': 10 if timeframe == '30m' else 14,
-            'ma_period': 100 if timeframe == '30m' else 200,
-            'confirmation_timeframe': '1h' if timeframe == '30m' else '15m',
-            'max_positions': 5 if timeframe == '30m' else 3,
-            'risk_per_trade': 0.015 if timeframe == '30m' else 0.02,
-            'stop_distance': 0.02 if timeframe == '30m' else 0.025,
-            'target_1_pct': 0.02 if timeframe == '30m' else 0.03,
-            'target_2_pct': 0.035 if timeframe == '30m' else 0.05,
-            'target_3_pct': 0.05 if timeframe == '30m' else 0.07,
-        })
-    
-    # Long-term timeframes (swing/position trading)
-    elif timeframe in ['2h', '4h', '6h', '12h', '1d']:
-        params.update({
+            'max_positions': 5,
+            'risk_per_trade': 0.015,
+            'stop_distance': 0.02,
+            'target_1_pct': 0.02,
+            'target_2_pct': 0.035,
+            'target_3_pct': 0.05,
+            'filters': ['ma', 'confirmation']  # Volume filter disabled for metals
+        }
+    else:
+        # Standard parameters for crypto
+        params = {
             'lookback': 500,
-            'bandwidth': 7.0 if timeframe in ['4h', '6h'] else 8.0,
-            'multiplier': 3.5 if timeframe in ['4h', '6h'] else 4.0,
+            'bandwidth': 6.0,
+            'multiplier': 3.0,
             'rsi_period': 14,
             'ma_period': 200,
-            'confirmation_timeframe': '1h',
+            'confirmation_timeframe': '15m',
             'max_positions': 3,
             'risk_per_trade': 0.02,
-            'stop_distance': 0.03,   # 3%
-            'target_1_pct': 0.04,    # 4%
-            'target_2_pct': 0.07,    # 7%
-            'target_3_pct': 0.10,    # 10%
-        })
+            'stop_distance': 0.025,
+            'target_1_pct': 0.03,
+            'target_2_pct': 0.05,
+            'target_3_pct': 0.07,
+            'filters': ['volume', 'ma', 'confirmation']
+        }
+    
+    # Adjust based on timeframe for non-metals
+    if not is_metal:
+        # Short-term timeframes (scalping/day trading)
+        if timeframe in ['1m', '5m', '15m']:
+            params.update({
+                'lookback': 200,
+                'bandwidth': 3.5,
+                'multiplier': 2.0,
+                'rsi_period': 8,
+                'ma_period': 50,
+                'confirmation_timeframe': '1h',
+                'max_positions': 8,
+                'risk_per_trade': 0.01,
+                'stop_distance': 0.015,
+                'target_1_pct': 0.015,
+                'target_2_pct': 0.025,
+                'target_3_pct': 0.04,
+            })
+        
+        # Medium-term timeframes (day trading)
+        elif timeframe in ['30m', '1h']:
+            params.update({
+                'lookback': 300 if timeframe == '30m' else 500,
+                'bandwidth': 4.5 if timeframe == '30m' else 6.0,
+                'multiplier': 2.5 if timeframe == '30m' else 3.0,
+                'rsi_period': 10 if timeframe == '30m' else 14,
+                'ma_period': 100 if timeframe == '30m' else 200,
+                'confirmation_timeframe': '1h' if timeframe == '30m' else '15m',
+                'max_positions': 5 if timeframe == '30m' else 3,
+                'risk_per_trade': 0.015 if timeframe == '30m' else 0.02,
+                'stop_distance': 0.02 if timeframe == '30m' else 0.025,
+                'target_1_pct': 0.02 if timeframe == '30m' else 0.03,
+                'target_2_pct': 0.035 if timeframe == '30m' else 0.05,
+                'target_3_pct': 0.05 if timeframe == '30m' else 0.07,
+            })
+        
+        # Long-term timeframes (swing/position trading)
+        elif timeframe in ['2h', '4h', '6h', '12h', '1d']:
+            params.update({
+                'lookback': 500,
+                'bandwidth': 7.0 if timeframe in ['4h', '6h'] else 8.0,
+                'multiplier': 3.5 if timeframe in ['4h', '6h'] else 4.0,
+                'rsi_period': 14,
+                'ma_period': 200,
+                'confirmation_timeframe': '1h',
+                'max_positions': 3,
+                'risk_per_trade': 0.02,
+                'stop_distance': 0.03,
+                'target_1_pct': 0.04,
+                'target_2_pct': 0.07,
+                'target_3_pct': 0.10,
+            })
     
     return params
 
@@ -238,30 +262,30 @@ def rsi(price, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# Cached exchange instances so load_markets() runs once per process,
-# not once per fetch_data() call (~4s -> ~0.27s per fetch).
-_EXCHANGES = {}
-
-def get_exchange(is_futures):
-    key = 'futures' if is_futures else 'spot'
-    if key not in _EXCHANGES:
+def fetch_data(symbol, timeframe, limit=550):
+    """Fetch data with special handling for metals"""
+    try:
+        is_futures = ':' in symbol
+        is_metal = symbol in METAL_SYMBOLS
+        
+        # For metals, we need to fetch more data to get enough for lookback
+        if is_metal:
+            # Binance Futures only returns ~50 bars, so we need to fetch multiple times
+            # Or use a smaller limit - we'll handle this in the scan function
+            limit = 100  # Request more, but Binance will still only return ~50
+            print(f"🔍 Fetching metal: {symbol} on {timeframe} (limit={limit})")
+        
         if is_futures:
-            _EXCHANGES[key] = ccxt.binanceusdm({
+            exchange = ccxt.binanceusdm({
                 'enableRateLimit': True,
                 'options': {'defaultType': 'future'}
             })
         else:
-            _EXCHANGES[key] = ccxt.binance({
+            exchange = ccxt.binance({
                 'enableRateLimit': True,
                 'options': {'defaultType': 'spot'}
             })
-    return _EXCHANGES[key]
-
-def fetch_data(symbol, timeframe, limit=550):
-    try:
-        is_futures = ':' in symbol
-        exchange = get_exchange(is_futures)
-
+        
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         return df
@@ -272,7 +296,7 @@ def fetch_data(symbol, timeframe, limit=550):
 
 def check_timeframe_confirmation(symbol, timeframe, rsi_period, rsi_threshold=35):
     df = fetch_data(symbol, timeframe, limit=100)
-    if df is None or len(df) < 50:
+    if df is None or len(df) < 30:
         return False, None
     
     close = df['close'].values
@@ -284,16 +308,22 @@ def check_timeframe_confirmation(symbol, timeframe, rsi_period, rsi_threshold=35
 # POSITION SIZING CALCULATOR
 # ============================================
 
-def calculate_position_size(price, stop_loss, confidence, account_size, risk_percent):
+def calculate_position_size(price, stop_loss, confidence, account_size, risk_percent, is_metal=False):
     base_risk = account_size * risk_percent
-    confidence_multiplier = 0.5 + (confidence / 100) * 1.0
+    
+    # Confidence multiplier (adjusted for metals)
+    if is_metal:
+        confidence_multiplier = 0.3 + (confidence / 100) * 0.7  # Lower for metals
+    else:
+        confidence_multiplier = 0.5 + (confidence / 100) * 1.0
+    
     adjusted_risk = base_risk * confidence_multiplier
     
     risk_per_unit = abs(price - stop_loss)
     position_size = adjusted_risk / risk_per_unit if risk_per_unit > 0 else 0
     position_value = position_size * price
     
-    max_position_value = account_size * 0.5
+    max_position_value = account_size * 0.3 if is_metal else account_size * 0.5
     if position_value > max_position_value:
         position_size = max_position_value / price
         position_value = max_position_value
@@ -310,52 +340,6 @@ def calculate_position_size(price, stop_loss, confidence, account_size, risk_per
         'risk_percent': round((adjusted_risk / account_size) * 100, 2),
         'confidence_multiplier': round(confidence_multiplier, 2)
     }
-
-# ============================================
-# FEED WRITER
-# ============================================
-
-def write_to_feed(signals, timeframe, feed_path="data/rsi_alerts.json"):
-    """Append detected signals to the rsi_alerts.json file."""
-    feed_entries = []
-    for sig in signals:
-        # Normalize confidence from 0-100 to 0-6 scale
-        conf = round(sig["confidence"] / 100 * 6, 1)
-
-        # Map direction
-        direction = "buy" if "BUY" in sig["signal_type"] else "sell"
-
-        entry = {
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": sig["symbol"],
-            "timeframe": timeframe,
-            "direction": direction,
-            "rsi": sig["rsi"],
-            "price": sig["entry"],
-            "pivot_level": None,
-            "pivot_distance": None,
-            "confidence": conf,
-            "sl": sig["stop_loss"],
-            "tp": sig["tp1"],  # Use TP1 as primary target
-            "signal_source": "signal_scanner"
-        }
-        feed_entries.append(entry)
-
-    # Read existing feed, prepend new entries
-    os.makedirs(os.path.dirname(feed_path), exist_ok=True)
-    existing = []
-    if os.path.exists(feed_path):
-        with open(feed_path, "r") as f:
-            try:
-                existing = json.load(f)
-            except json.JSONDecodeError:
-                existing = []
-
-    combined = (feed_entries + existing)[:500]
-    with open(feed_path, "w") as f:
-        json.dump(combined, f, indent=2)
-
-    print(f"Wrote {len(feed_entries)} signals to {feed_path}")
 
 # ============================================
 # SUGGESTED ENTRY/EXIT PRICES (3 TARGETS)
@@ -392,12 +376,10 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
     
     if rsi_1h is not None:
         if signal_type.startswith('SELL') and rsi_1h < 30:
-            # 1h oversold - only sell on a bounce (higher price)
-            adjustment_pct = ((30 - rsi_1h) / 30) * 0.02  # Up to 2% higher
+            adjustment_pct = ((30 - rsi_1h) / 30) * 0.02
             entry_adjustment = price * adjustment_pct
         elif signal_type.startswith('BUY') and rsi_1h > 70:
-            # 1h overbought - only buy on a dip (lower price)
-            adjustment_pct = ((rsi_1h - 70) / 30) * 0.02  # Up to 2% lower
+            adjustment_pct = ((rsi_1h - 70) / 30) * 0.02
             entry_adjustment = -price * adjustment_pct
     
     adjusted_entry = price + entry_adjustment
@@ -462,7 +444,7 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
 # ENHANCED SIGNAL DETECTION WITH HIGHER TIMEFRAME OVERRULE
 # ============================================
 
-def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
+def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is_metal=False):
     current = price[-1]
     prev = price[-2]
     signals = []
@@ -538,8 +520,8 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
         filters_triggered = []
         skip_signal = False
         
-        # FILTER 1: Volume Analysis
-        if len(volume) > 15:
+        # FILTER 1: Volume Analysis (SKIP FOR METALS)
+        if not is_metal and len(volume) > 15:
             avg_volume = np.mean(volume[-15:])
             current_volume = volume[-1]
             volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
@@ -570,6 +552,8 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
                 filters_triggered.append(f"📈 Volume {volume_ratio:.1f}x avg")
             else:
                 filters_triggered.append(f"📉 Volume {volume_ratio:.1f}x avg")
+        elif is_metal:
+            filters_triggered.append(f"💰 Metal: Volume filter bypassed")
         
         # FILTER 2: MA Trend Alignment
         if len(price) > ma_period:
@@ -686,7 +670,7 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
                 'description': signal['description'],
                 'filters': filters_triggered,
                 'base_confidence': signal['base_confidence'],
-                'rsi_1h': rsi_1h  # Pass through for entry adjustment
+                'rsi_1h': rsi_1h
             })
     
     enhanced_signals.sort(key=lambda x: x['confidence'], reverse=True)
@@ -697,29 +681,40 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
 # ============================================
 
 def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positions):
-    params = get_timeframe_params(timeframe)
     results = []
     
     print(f"\n{'='*110}")
     print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*110}")
     print(f"Account: ${account_size:,} | Risk: {risk_percent*100:.1f}% per trade | Max Positions: {max_positions}")
-    print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
-    print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
-    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures")
+    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures (XAU/XAG)")
     print(f"{'='*110}\n")
     
     for symbol in SYMBOLS:
         try:
-            df = fetch_data(symbol, timeframe, params['lookback'] + 50)
-            if df is None or len(df) < params['lookback']:
+            is_metal = symbol in METAL_SYMBOLS
+            
+            # Get parameters (different for metals)
+            params = get_timeframe_params(timeframe, is_metal)
+            
+            # For metals, we need to use the lookback + some buffer
+            lookback_needed = params['lookback']
+            fetch_limit = lookback_needed + 50
+            
+            df = fetch_data(symbol, timeframe, limit=fetch_limit)
+            
+            if df is None or len(df) < max(30, lookback_needed * 0.6):  # Allow 60% of lookback for metals
+                if is_metal:
+                    print(f"⚠️ {symbol}: Only {len(df) if df is not None else 0} bars (needs ~{lookback_needed * 0.6:.0f} for metal)")
                 continue
             
             close = df['close'].values
             volume = df['volume'].values
             
+            # If we don't have enough bars for the full lookback, use what we have
+            actual_lookback = min(lookback_needed, len(close))
             mid, upper, lower = nadaraya_watson_envelope(
-                close, params['bandwidth'], params['multiplier'], params['lookback']
+                close, params['bandwidth'], params['multiplier'], actual_lookback
             )
             
             if mid is None:
@@ -729,7 +724,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             current_price = close[-1]
             
             signals = detect_signals(
-                close, volume, rsi_val, lower, upper, mid, symbol, params
+                close, volume, rsi_val, lower, upper, mid, symbol, params, is_metal
             )
             
             if signals:
@@ -738,12 +733,12 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
                 entry_exit = calculate_entry_exit(
                     current_price, lower, upper, mid,
                     best['type'], best['confidence'], rsi_val, params,
-                    rsi_1h=best.get('rsi_1h')  # Pass the 1h RSI for entry adjustment
+                    rsi_1h=best.get('rsi_1h')
                 )
                 
                 position_size = calculate_position_size(
                     current_price, entry_exit['stop_loss'], best['confidence'],
-                    account_size, risk_percent
+                    account_size, risk_percent, is_metal
                 )
                 
                 position = "Inside"
@@ -884,10 +879,6 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             print(f"      TP1: ${row['tp1']:.4f} | TP2: ${row['tp2']:.4f} | TP3: ${row['tp3']:.4f}")
     
     print(f"{'='*110}")
-
-    # Write detected signals to the feed
-    write_to_feed(signals_df.to_dict('records'), timeframe)
-
     return df_results
 
 # ============================================
@@ -932,6 +923,7 @@ def main():
     print(f"   Max positions: {args.max_positions}")
     if args.verbose:
         print("   Verbose mode: ON (showing all symbols)")
+    print(f"   Metals: XAU/XAG with reduced lookback ({get_timeframe_params(args.timeframe, True)['lookback']} bars)")
     
     start_time = time.time()
     results = scan_with_signals(
