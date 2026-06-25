@@ -232,61 +232,88 @@ def get_timeframe_params(timeframe, is_metal=False):
     return params
 
 # ============================================
-# BITCOIN MARKET FILTER
+# BITCOIN MARKET FILTER (HIGHER TIMEFRAME)
 # ============================================
 
-def get_btc_market_state(timeframe, lookback=10, threshold=1.5):
+def get_btc_market_state_higher_tf(timeframe, threshold=1.5):
     """
-    Analyze Bitcoin's current market state
-    Returns: 'strong_bullish', 'bullish', 'neutral', 'bearish', 'strong_bearish'
+    Analyze Bitcoin's trend using HIGHER TIMEFRAMES
+    Returns: (state, change_pct, timeframe_used)
     """
     try:
-        # Fetch BTC data
-        df = fetch_data('BTC/USDT', timeframe, limit=lookback + 5)
-        if df is None or len(df) < lookback:
-            return 'neutral', 0.0
-        
-        close = df['close'].values
-        current_price = close[-1]
-        price_5_ago = close[-5] if len(close) >= 5 else current_price
-        price_10_ago = close[-10] if len(close) >= 10 else current_price
-        
-        # Calculate changes
-        change_5 = ((current_price - price_5_ago) / price_5_ago) * 100
-        change_10 = ((current_price - price_10_ago) / price_10_ago) * 100
-        
-        # Use average of 5 and 10 bar changes
-        avg_change = (change_5 + change_10) / 2
-        
-        # Determine state
-        if avg_change > threshold * 2:
-            state = 'strong_bullish'
-        elif avg_change > threshold:
-            state = 'bullish'
-        elif avg_change < -threshold * 2:
-            state = 'strong_bearish'
-        elif avg_change < -threshold:
-            state = 'bearish'
+        # Determine which higher timeframe to use
+        if timeframe in ['1m', '5m', '15m']:
+            # For short-term signals, check 1h and 4h
+            tfs_to_check = ['1h', '4h']
+        elif timeframe in ['30m', '1h']:
+            # For medium-term signals, check 4h and 1d
+            tfs_to_check = ['4h', '1d']
         else:
-            state = 'neutral'
+            # For long-term signals, check 1d
+            tfs_to_check = ['1d']
         
-        return state, avg_change
+        states = []
+        changes = []
+        
+        for tf in tfs_to_check:
+            df = fetch_data('BTC/USDT', tf, limit=20)
+            if df is None or len(df) < 10:
+                continue
+            
+            close = df['close'].values
+            current_price = close[-1]
+            price_5_ago = close[-5] if len(close) >= 5 else current_price
+            price_10_ago = close[-10] if len(close) >= 10 else current_price
+            
+            # Calculate changes
+            change_5 = ((current_price - price_5_ago) / price_5_ago) * 100
+            change_10 = ((current_price - price_10_ago) / price_10_ago) * 100
+            avg_change = (change_5 + change_10) / 2
+            
+            # Determine state for this timeframe
+            if avg_change > threshold * 2:
+                state = 'strong_bullish'
+            elif avg_change > threshold:
+                state = 'bullish'
+            elif avg_change < -threshold * 2:
+                state = 'strong_bearish'
+            elif avg_change < -threshold:
+                state = 'bearish'
+            else:
+                state = 'neutral'
+            
+            states.append(state)
+            changes.append(avg_change)
+        
+        # If we have multiple timeframes, use the more bearish/bullish one
+        # (higher timeframe takes precedence)
+        if len(states) >= 2:
+            # Prioritize: strong_bearish > bearish > neutral > bullish > strong_bullish
+            priority = {'strong_bearish': 0, 'bearish': 1, 'neutral': 2, 'bullish': 3, 'strong_bullish': 4}
+            
+            # Get the most bearish or bullish state (whichever is more extreme)
+            worst_state = min(states, key=lambda x: priority.get(x, 2))
+            worst_change = changes[states.index(worst_state)]
+            
+            return worst_state, worst_change, tfs_to_check[0]
+        elif len(states) == 1:
+            return states[0], changes[0], tfs_to_check[0]
+        else:
+            return 'neutral', 0.0, 'unknown'
         
     except Exception as e:
-        print(f"⚠️ BTC market filter error: {str(e)[:60]}")
-        return 'neutral', 0.0
+        print(f"⚠️ BTC higher TF filter error: {str(e)[:60]}")
+        return 'neutral', 0.0, 'unknown'
 
-def apply_btc_filter(signal_type, confidence, btc_state, btc_change):
+def apply_btc_filter_higher_tf(signal_type, confidence, btc_state, btc_change, btc_tf):
     """
-    Apply Bitcoin market filter to reverse or adjust signals
-    Returns: (new_signal_type, confidence_adjustment, filter_message)
+    Apply Bitcoin filter based on HIGHER TIMEFRAME trend
     """
-    
     # If neutral, no change
     if btc_state == 'neutral':
-        return signal_type, 0, f"BTC neutral ({btc_change:.1f}%)"
+        return signal_type, 0, f"BTC {btc_tf} neutral ({btc_change:.1f}%)"
     
-    # Define reversal logic
+    # Define reversal map
     reversal_map = {
         'BUY_OVERSOLD': 'SELL_OVERBOUGHT',
         'SELL_OVERBOUGHT': 'BUY_OVERSOLD',
@@ -296,36 +323,54 @@ def apply_btc_filter(signal_type, confidence, btc_state, btc_change):
         'EXTREME_OVERBOUGHT': 'EXTREME_OVERSOLD'
     }
     
-    # Strong signals get reversed
-    if btc_state in ['strong_bullish', 'strong_bearish']:
-        # Reverse the signal
-        new_signal = reversal_map.get(signal_type, signal_type)
-        
-        # Add confidence penalty for reversal
-        confidence_adj = -15  # Reversals are less confident
-        
-        message = f"⚠️ BTC {btc_state} ({btc_change:.1f}%) - SIGNAL REVERSED: {signal_type} → {new_signal}"
-        return new_signal, confidence_adj, message
-    
-    # Mild signals get adjusted but not fully reversed
-    elif btc_state in ['bullish', 'bearish']:
-        if signal_type.startswith('BUY') and btc_state == 'bearish':
-            # Downgrade BUY signals in bearish market
-            confidence_adj = -10
-            message = f"⚠️ BTC bearish ({btc_change:.1f}%) - BUY signals downgraded"
+    # STRONG bearish: REVERSE all BUY signals
+    if btc_state == 'strong_bearish':
+        if signal_type.startswith('BUY'):
+            new_signal = reversal_map.get(signal_type, signal_type)
+            confidence_adj = -20
+            message = f"⚠️ BTC {btc_tf} STRONG BEARISH ({btc_change:.1f}%) - SIGNAL REVERSED: {signal_type} → {new_signal}"
+            return new_signal, confidence_adj, message
+        else:
+            # SELL signals are confirmed
+            confidence_adj = 10
+            message = f"✅ BTC {btc_tf} STRONG BEARISH ({btc_change:.1f}%) - SELL confirmed"
             return signal_type, confidence_adj, message
-        elif signal_type.startswith('SELL') and btc_state == 'bullish':
-            # Downgrade SELL signals in bullish market
-            confidence_adj = -10
-            message = f"⚠️ BTC bullish ({btc_change:.1f}%) - SELL signals downgraded"
+    
+    # Bearish: DOWNGRADE BUY signals, CONFIRM SELL signals
+    elif btc_state == 'bearish':
+        if signal_type.startswith('BUY'):
+            confidence_adj = -20  # Bigger penalty
+            message = f"⚠️ BTC {btc_tf} bearish ({btc_change:.1f}%) - BUY downgraded"
             return signal_type, confidence_adj, message
         else:
-            # Signal aligns with BTC trend
             confidence_adj = 5
-            message = f"✅ BTC {btc_state} ({btc_change:.1f}%) - signal aligns"
+            message = f"✅ BTC {btc_tf} bearish ({btc_change:.1f}%) - SELL confirmed"
             return signal_type, confidence_adj, message
     
-    return signal_type, 0, f"BTC neutral ({btc_change:.1f}%)"
+    # Strong bullish: REVERSE all SELL signals
+    elif btc_state == 'strong_bullish':
+        if signal_type.startswith('SELL'):
+            new_signal = reversal_map.get(signal_type, signal_type)
+            confidence_adj = -20
+            message = f"⚠️ BTC {btc_tf} STRONG BULLISH ({btc_change:.1f}%) - SIGNAL REVERSED: {signal_type} → {new_signal}"
+            return new_signal, confidence_adj, message
+        else:
+            confidence_adj = 10
+            message = f"✅ BTC {btc_tf} STRONG BULLISH ({btc_change:.1f}%) - BUY confirmed"
+            return signal_type, confidence_adj, message
+    
+    # Bullish: DOWNGRADE SELL signals, CONFIRM BUY signals
+    elif btc_state == 'bullish':
+        if signal_type.startswith('SELL'):
+            confidence_adj = -20
+            message = f"⚠️ BTC {btc_tf} bullish ({btc_change:.1f}%) - SELL downgraded"
+            return signal_type, confidence_adj, message
+        else:
+            confidence_adj = 5
+            message = f"✅ BTC {btc_tf} bullish ({btc_change:.1f}%) - BUY confirmed"
+            return signal_type, confidence_adj, message
+    
+    return signal_type, 0, f"BTC {btc_tf} neutral ({btc_change:.1f}%)"
 
 # ============================================
 # INDICATOR FUNCTIONS
@@ -552,7 +597,7 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
 # ENHANCED SIGNAL DETECTION WITH HIGHER TIMEFRAME OVERRULE
 # ============================================
 
-def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is_metal=False, btc_state='neutral', btc_change=0):
+def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is_metal=False, btc_state='neutral', btc_change=0, btc_tf='unknown'):
     current = price[-1]
     prev = price[-2]
     signals = []
@@ -768,8 +813,8 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
         # ============================================
         # Apply BTC filter (only for non-BTC symbols)
         if symbol != 'BTC/USDT' and btc_state != 'neutral':
-            new_signal, btc_confidence_adj, btc_message = apply_btc_filter(
-                signal['type'], confidence, btc_state, btc_change
+            new_signal, btc_confidence_adj, btc_message = apply_btc_filter_higher_tf(
+                signal['type'], confidence, btc_state, btc_change, btc_tf
             )
             
             # Update signal type and confidence
@@ -817,8 +862,9 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     if use_btc_filter:
         print(f"🐂 Bitcoin Market Filter: ENABLED (threshold: {btc_threshold}%)")
         # Check BTC state for display
-        btc_state, btc_change = get_btc_market_state(timeframe, threshold=btc_threshold)
-        print(f"   BTC Market State: {btc_state.upper()} ({btc_change:.2f}%)")
+        btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=btc_threshold)
+        print(f"   BTC Market State: {btc_state.upper()} ({btc_change:.2f}%) on {btc_tf}")
+
     else:
         print(f"🐂 Bitcoin Market Filter: DISABLED")
     print(f"{'='*110}\n")
@@ -827,7 +873,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     btc_state = 'neutral'
     btc_change = 0.0
     if use_btc_filter:
-        btc_state, btc_change = get_btc_market_state(timeframe, threshold=btc_threshold)
+        btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=btc_threshold)
     
     for symbol in SYMBOLS:
         try:
