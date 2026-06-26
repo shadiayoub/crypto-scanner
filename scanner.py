@@ -2,7 +2,6 @@
 """
 Multi-Asset Scanner with Nadaraya-Watson Envelope
 Supports both long-term and short-term timeframes via command-line arguments
-Includes Bitcoin Market Filter for trend reversal detection
 
 Usage:
     python scanner.py                    # Default: 1h timeframe
@@ -21,6 +20,8 @@ import time
 import warnings
 import argparse
 import sys
+import json
+import os
 warnings.filterwarnings('ignore')
 
 # ============================================
@@ -40,7 +41,6 @@ Examples:
   python scanner.py -tf 4h             # 4-hour timeframe
   python scanner.py -tf 1h -v          # Verbose mode with all filters
   python scanner.py --list-timeframes  # Show all available timeframes
-  python scanner.py --no-btc-filter    # Disable Bitcoin market filter
         """
     )
     
@@ -84,19 +84,6 @@ Examples:
         help='Maximum concurrent positions (default: 3)'
     )
     
-    parser.add_argument(
-        '--no-btc-filter',
-        action='store_true',
-        help='Disable Bitcoin market filter (use at your own risk)'
-    )
-    
-    parser.add_argument(
-        '--btc-threshold',
-        type=float,
-        default=1.5,
-        help='BTC price change threshold to trigger filter reversal (default: 1.5%%)'
-    )
-    
     return parser.parse_args()
 
 # ============================================
@@ -114,7 +101,7 @@ SPOT_SYMBOLS = [
     'JUP/USDT', 'KAITO/USDT', 'LDO/USDT', 'LIT/USDT', 'LTC/USDT',
     'ONDO/USDT', 'ORDI/USDT', 'PENGU/USDT', 'PNUT/USDT',
     'POL/USDT', 'PUMP/USDT', 'RENDER/USDT', 'S/USDT',
-    'SHIB/USDT', 'STX/USDT', 'TAO/USDT', 'TIA/USDT', 'TRUMP/USDT',
+    'SHIB/USDT', 'STX/USDT', 'TAO/USDT', 'TIA/USDT',
     'TRX/USDT', 'UNI/USDT', 'VIRTUAL/USDT', 'WLD/USDT', 
     'ZEC/USDT'
 ]
@@ -125,9 +112,6 @@ FUTURES_SYMBOLS = [
     'XAG/USDT:USDT'   # Silver perpetual
 ]
 
-# Define metals for special handling
-METAL_SYMBOLS = ['XAU/USDT:USDT', 'XAG/USDT:USDT']
-
 # Combine all symbols
 SYMBOLS = SPOT_SYMBOLS + FUTURES_SYMBOLS
 
@@ -135,242 +119,78 @@ SYMBOLS = SPOT_SYMBOLS + FUTURES_SYMBOLS
 # TIMEFRAME-SPECIFIC PARAMETERS
 # ============================================
 
-def get_timeframe_params(timeframe, is_metal=False):
+def get_timeframe_params(timeframe):
     """
     Returns optimized parameters for each timeframe
-    For metals, uses reduced lookback due to limited historical data
     """
-    # Base parameters
-    if is_metal:
-        # Metals have limited data (only ~50 bars on Binance Futures)
-        params = {
-            'lookback': 40,  # Much smaller for metals
-            'bandwidth': 4.0,
-            'multiplier': 2.5,
-            'rsi_period': 10,
-            'ma_period': 30,
-            'confirmation_timeframe': '1h',
-            'max_positions': 5,
-            'risk_per_trade': 0.015,
-            'stop_distance': 0.02,
-            'target_1_pct': 0.02,
-            'target_2_pct': 0.035,
-            'target_3_pct': 0.05,
-            'filters': ['ma', 'confirmation']  # Volume filter disabled for metals
-        }
-    else:
-        # Standard parameters for crypto
-        params = {
-            'lookback': 500,
-            'bandwidth': 6.0,
-            'multiplier': 3.0,
-            'rsi_period': 14,
-            'ma_period': 200,
-            'confirmation_timeframe': '15m',
-            'max_positions': 3,
-            'risk_per_trade': 0.02,
-            'stop_distance': 0.025,
-            'target_1_pct': 0.03,
-            'target_2_pct': 0.05,
-            'target_3_pct': 0.07,
-            'filters': ['volume', 'ma', 'confirmation']
-        }
-    
-    # Adjust based on timeframe for non-metals
-    if not is_metal:
-        # Short-term timeframes (scalping/day trading)
-        if timeframe in ['1m', '5m', '15m']:
-            params.update({
-                'lookback': 200,
-                'bandwidth': 3.5,
-                'multiplier': 2.0,
-                'rsi_period': 8,
-                'ma_period': 50,
-                'confirmation_timeframe': '1h',
-                'max_positions': 8,
-                'risk_per_trade': 0.01,
-                'stop_distance': 0.015,
-                'target_1_pct': 0.015,
-                'target_2_pct': 0.025,
-                'target_3_pct': 0.04,
-            })
-        
-        # Medium-term timeframes (day trading)
-        elif timeframe in ['30m', '1h']:
-            params.update({
-                'lookback': 300 if timeframe == '30m' else 500,
-                'bandwidth': 4.5 if timeframe == '30m' else 6.0,
-                'multiplier': 2.5 if timeframe == '30m' else 3.0,
-                'rsi_period': 10 if timeframe == '30m' else 14,
-                'ma_period': 100 if timeframe == '30m' else 200,
-                'confirmation_timeframe': '1h' if timeframe == '30m' else '15m',
-                'max_positions': 5 if timeframe == '30m' else 3,
-                'risk_per_trade': 0.015 if timeframe == '30m' else 0.02,
-                'stop_distance': 0.02 if timeframe == '30m' else 0.025,
-                'target_1_pct': 0.02 if timeframe == '30m' else 0.03,
-                'target_2_pct': 0.035 if timeframe == '30m' else 0.05,
-                'target_3_pct': 0.05 if timeframe == '30m' else 0.07,
-            })
-        
-        # Long-term timeframes (swing/position trading)
-        elif timeframe in ['2h', '4h', '6h', '12h', '1d']:
-            params.update({
-                'lookback': 500,
-                'bandwidth': 7.0 if timeframe in ['4h', '6h'] else 8.0,
-                'multiplier': 3.5 if timeframe in ['4h', '6h'] else 4.0,
-                'rsi_period': 14,
-                'ma_period': 200,
-                'confirmation_timeframe': '1h',
-                'max_positions': 3,
-                'risk_per_trade': 0.02,
-                'stop_distance': 0.03,
-                'target_1_pct': 0.04,
-                'target_2_pct': 0.07,
-                'target_3_pct': 0.10,
-            })
-    
-    return params
-
-# ============================================
-# BITCOIN MARKET FILTER (HIGHER TIMEFRAME)
-# ============================================
-
-def get_btc_market_state_higher_tf(timeframe, threshold=1.5):
-    """
-    Analyze Bitcoin's trend using HIGHER TIMEFRAMES
-    Returns: (state, change_pct, timeframe_used)
-    """
-    try:
-        # Determine which higher timeframe to use
-        if timeframe in ['1m', '5m', '15m']:
-            # For short-term signals, check 1h and 4h
-            tfs_to_check = ['1h', '4h']
-        elif timeframe in ['30m', '1h']:
-            # For medium-term signals, check 4h and 1d
-            tfs_to_check = ['4h', '1d']
-        else:
-            # For long-term signals, check 1d
-            tfs_to_check = ['1d']
-        
-        states = []
-        changes = []
-        
-        for tf in tfs_to_check:
-            df = fetch_data('BTC/USDT', tf, limit=20)
-            if df is None or len(df) < 10:
-                continue
-            
-            close = df['close'].values
-            current_price = close[-1]
-            price_5_ago = close[-5] if len(close) >= 5 else current_price
-            price_10_ago = close[-10] if len(close) >= 10 else current_price
-            
-            # Calculate changes
-            change_5 = ((current_price - price_5_ago) / price_5_ago) * 100
-            change_10 = ((current_price - price_10_ago) / price_10_ago) * 100
-            avg_change = (change_5 + change_10) / 2
-            
-            # Determine state for this timeframe
-            if avg_change > threshold * 2:
-                state = 'strong_bullish'
-            elif avg_change > threshold:
-                state = 'bullish'
-            elif avg_change < -threshold * 2:
-                state = 'strong_bearish'
-            elif avg_change < -threshold:
-                state = 'bearish'
-            else:
-                state = 'neutral'
-            
-            states.append(state)
-            changes.append(avg_change)
-        
-        # If we have multiple timeframes, use the more bearish/bullish one
-        # (higher timeframe takes precedence)
-        if len(states) >= 2:
-            # Prioritize: strong_bearish > bearish > neutral > bullish > strong_bullish
-            priority = {'strong_bearish': 0, 'bearish': 1, 'neutral': 2, 'bullish': 3, 'strong_bullish': 4}
-            
-            # Get the most bearish or bullish state (whichever is more extreme)
-            worst_state = min(states, key=lambda x: priority.get(x, 2))
-            worst_change = changes[states.index(worst_state)]
-            
-            return worst_state, worst_change, tfs_to_check[0]
-        elif len(states) == 1:
-            return states[0], changes[0], tfs_to_check[0]
-        else:
-            return 'neutral', 0.0, 'unknown'
-        
-    except Exception as e:
-        print(f"⚠️ BTC higher TF filter error: {str(e)[:60]}")
-        return 'neutral', 0.0, 'unknown'
-
-def apply_btc_filter_higher_tf(signal_type, confidence, btc_state, btc_change, btc_tf):
-    """
-    Apply Bitcoin filter based on HIGHER TIMEFRAME trend
-    """
-    # If neutral, no change
-    if btc_state == 'neutral':
-        return signal_type, 0, f"BTC {btc_tf} neutral ({btc_change:.1f}%)"
-    
-    # Define reversal map
-    reversal_map = {
-        'BUY_OVERSOLD': 'SELL_OVERBOUGHT',
-        'SELL_OVERBOUGHT': 'BUY_OVERSOLD',
-        'BUY_CROSS': 'SELL_CROSS',
-        'SELL_CROSS': 'BUY_CROSS',
-        'EXTREME_OVERSOLD': 'EXTREME_OVERBOUGHT',
-        'EXTREME_OVERBOUGHT': 'EXTREME_OVERSOLD'
+    params = {
+        'lookback': 500,
+        'bandwidth': 6.0,
+        'multiplier': 3.0,
+        'rsi_period': 14,
+        'ma_period': 200,
+        'confirmation_timeframe': '15m',
+        'max_positions': 3,
+        'risk_per_trade': 0.02,
+        'stop_distance': 0.025,  # 2.5%
+        'target_1_pct': 0.03,    # 3%
+        'target_2_pct': 0.05,    # 5%
+        'target_3_pct': 0.07,    # 7%
+        'filters': ['volume', 'ma', 'confirmation']
     }
     
-    # STRONG bearish: REVERSE all BUY signals
-    if btc_state == 'strong_bearish':
-        if signal_type.startswith('BUY'):
-            new_signal = reversal_map.get(signal_type, signal_type)
-            confidence_adj = -20
-            message = f"⚠️ BTC {btc_tf} STRONG BEARISH ({btc_change:.1f}%) - SIGNAL REVERSED: {signal_type} → {new_signal}"
-            return new_signal, confidence_adj, message
-        else:
-            # SELL signals are confirmed
-            confidence_adj = 10
-            message = f"✅ BTC {btc_tf} STRONG BEARISH ({btc_change:.1f}%) - SELL confirmed"
-            return signal_type, confidence_adj, message
+    # Short-term timeframes (scalping/day trading)
+    if timeframe in ['1m', '5m', '15m']:
+        params.update({
+            'lookback': 200,
+            'bandwidth': 3.5,
+            'multiplier': 2.0,
+            'rsi_period': 8,
+            'ma_period': 50,
+            'confirmation_timeframe': '1h',
+            'max_positions': 8,
+            'risk_per_trade': 0.01,
+            'stop_distance': 0.015,  # 1.5%
+            'target_1_pct': 0.015,   # 1.5%
+            'target_2_pct': 0.025,   # 2.5%
+            'target_3_pct': 0.04,    # 4%
+        })
     
-    # Bearish: DOWNGRADE BUY signals, CONFIRM SELL signals
-    elif btc_state == 'bearish':
-        if signal_type.startswith('BUY'):
-            confidence_adj = -20  # Bigger penalty
-            message = f"⚠️ BTC {btc_tf} bearish ({btc_change:.1f}%) - BUY downgraded"
-            return signal_type, confidence_adj, message
-        else:
-            confidence_adj = 5
-            message = f"✅ BTC {btc_tf} bearish ({btc_change:.1f}%) - SELL confirmed"
-            return signal_type, confidence_adj, message
+    # Medium-term timeframes (day trading)
+    elif timeframe in ['30m', '1h']:
+        params.update({
+            'lookback': 300 if timeframe == '30m' else 500,
+            'bandwidth': 4.5 if timeframe == '30m' else 6.0,
+            'multiplier': 2.5 if timeframe == '30m' else 3.0,
+            'rsi_period': 10 if timeframe == '30m' else 14,
+            'ma_period': 100 if timeframe == '30m' else 200,
+            'confirmation_timeframe': '1h' if timeframe == '30m' else '15m',
+            'max_positions': 5 if timeframe == '30m' else 3,
+            'risk_per_trade': 0.015 if timeframe == '30m' else 0.02,
+            'stop_distance': 0.02 if timeframe == '30m' else 0.025,
+            'target_1_pct': 0.02 if timeframe == '30m' else 0.03,
+            'target_2_pct': 0.035 if timeframe == '30m' else 0.05,
+            'target_3_pct': 0.05 if timeframe == '30m' else 0.07,
+        })
     
-    # Strong bullish: REVERSE all SELL signals
-    elif btc_state == 'strong_bullish':
-        if signal_type.startswith('SELL'):
-            new_signal = reversal_map.get(signal_type, signal_type)
-            confidence_adj = -20
-            message = f"⚠️ BTC {btc_tf} STRONG BULLISH ({btc_change:.1f}%) - SIGNAL REVERSED: {signal_type} → {new_signal}"
-            return new_signal, confidence_adj, message
-        else:
-            confidence_adj = 10
-            message = f"✅ BTC {btc_tf} STRONG BULLISH ({btc_change:.1f}%) - BUY confirmed"
-            return signal_type, confidence_adj, message
+    # Long-term timeframes (swing/position trading)
+    elif timeframe in ['2h', '4h', '6h', '12h', '1d']:
+        params.update({
+            'lookback': 500,
+            'bandwidth': 7.0 if timeframe in ['4h', '6h'] else 8.0,
+            'multiplier': 3.5 if timeframe in ['4h', '6h'] else 4.0,
+            'rsi_period': 14,
+            'ma_period': 200,
+            'confirmation_timeframe': '1h',
+            'max_positions': 3,
+            'risk_per_trade': 0.02,
+            'stop_distance': 0.03,   # 3%
+            'target_1_pct': 0.04,    # 4%
+            'target_2_pct': 0.07,    # 7%
+            'target_3_pct': 0.10,    # 10%
+        })
     
-    # Bullish: DOWNGRADE SELL signals, CONFIRM BUY signals
-    elif btc_state == 'bullish':
-        if signal_type.startswith('SELL'):
-            confidence_adj = -20
-            message = f"⚠️ BTC {btc_tf} bullish ({btc_change:.1f}%) - SELL downgraded"
-            return signal_type, confidence_adj, message
-        else:
-            confidence_adj = 5
-            message = f"✅ BTC {btc_tf} bullish ({btc_change:.1f}%) - BUY confirmed"
-            return signal_type, confidence_adj, message
-    
-    return signal_type, 0, f"BTC {btc_tf} neutral ({btc_change:.1f}%)"
+    return params
 
 # ============================================
 # INDICATOR FUNCTIONS
@@ -418,38 +238,41 @@ def rsi(price, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def fetch_data(symbol, timeframe, limit=550):
-    """Fetch data with special handling for metals"""
-    try:
-        is_futures = ':' in symbol
-        is_metal = symbol in METAL_SYMBOLS
-        
-        # For metals, we need to fetch more data to get enough for lookback
-        if is_metal:
-            limit = 100
-        
+# Cached exchange instances so load_markets() runs once per process,
+# not once per fetch_data() call (~4s -> ~0.27s per fetch).
+_EXCHANGES = {}
+
+def get_exchange(is_futures):
+    key = 'futures' if is_futures else 'spot'
+    if key not in _EXCHANGES:
         if is_futures:
-            exchange = ccxt.binanceusdm({
+            _EXCHANGES[key] = ccxt.binanceusdm({
                 'enableRateLimit': True,
                 'options': {'defaultType': 'future'}
             })
         else:
-            exchange = ccxt.binance({
+            _EXCHANGES[key] = ccxt.binance({
                 'enableRateLimit': True,
                 'options': {'defaultType': 'spot'}
             })
-        
+    return _EXCHANGES[key]
+
+def fetch_data(symbol, timeframe, limit=550):
+    try:
+        is_futures = ':' in symbol
+        exchange = get_exchange(is_futures)
+
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         return df
-        
+
     except Exception as e:
         print(f"⚠️ {symbol}: fetch error - {str(e)[:60]}")
         return None
 
 def check_timeframe_confirmation(symbol, timeframe, rsi_period, rsi_threshold=35):
     df = fetch_data(symbol, timeframe, limit=100)
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 50:
         return False, None
     
     close = df['close'].values
@@ -461,22 +284,16 @@ def check_timeframe_confirmation(symbol, timeframe, rsi_period, rsi_threshold=35
 # POSITION SIZING CALCULATOR
 # ============================================
 
-def calculate_position_size(price, stop_loss, confidence, account_size, risk_percent, is_metal=False):
+def calculate_position_size(price, stop_loss, confidence, account_size, risk_percent):
     base_risk = account_size * risk_percent
-    
-    # Confidence multiplier (adjusted for metals)
-    if is_metal:
-        confidence_multiplier = 0.3 + (confidence / 100) * 0.7  # Lower for metals
-    else:
-        confidence_multiplier = 0.5 + (confidence / 100) * 1.0
-    
+    confidence_multiplier = 0.5 + (confidence / 100) * 1.0
     adjusted_risk = base_risk * confidence_multiplier
     
     risk_per_unit = abs(price - stop_loss)
     position_size = adjusted_risk / risk_per_unit if risk_per_unit > 0 else 0
     position_value = position_size * price
     
-    max_position_value = account_size * 0.3 if is_metal else account_size * 0.5
+    max_position_value = account_size * 0.5
     if position_value > max_position_value:
         position_size = max_position_value / price
         position_value = max_position_value
@@ -493,6 +310,66 @@ def calculate_position_size(price, stop_loss, confidence, account_size, risk_per
         'risk_percent': round((adjusted_risk / account_size) * 100, 2),
         'confidence_multiplier': round(confidence_multiplier, 2)
     }
+
+# ============================================
+# FEED WRITER
+# ============================================
+
+def write_to_feed(signals, timeframe, feed_path="/home/algo/algo/data/rsi_alerts.json"):
+    """Append detected signals to the rsi_alerts.json file."""
+    feed_entries = []
+    for sig in signals:
+        # Normalize confidence from 0-100 to 0-6 scale
+        conf = round(sig["confidence"] / 100 * 6, 1)
+
+        # Map direction
+        direction = "buy" if "BUY" in sig["signal_type"] else "sell"
+
+        # Normalize symbol to DoochyBot format
+        raw_symbol = sig["symbol"]
+        if ":" in raw_symbol:
+            raw_symbol = raw_symbol.split(":")[0]  # "XAU/USDT:USDT" → "XAU/USDT"
+        if "/" in raw_symbol:
+            raw_symbol = raw_symbol.split("/")[0] + "USD"  # "XAU/USDT" → "XAUUSD"
+        # Crypto that's already a ticker stays as-is after removing suffix
+        symbol = raw_symbol
+
+        entry = {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "direction": direction,
+            "rsi": sig["rsi"],
+            "price": sig["entry"],
+            "pivot_level": None,
+            "pivot_distance": None,
+            "confidence": conf,
+            "sl": sig["stop_loss"],
+            "tp": sig["tp1"],  # Use TP1 as primary target
+            "signal_source": "signal_scanner"
+        }
+        feed_entries.append(entry)
+
+    # Read existing feed, prepend new entries
+    os.makedirs(os.path.dirname(feed_path), exist_ok=True)
+    existing = []
+    if os.path.exists(feed_path):
+        with open(feed_path, "r") as f:
+            try:
+                existing = json.load(f)
+            except json.JSONDecodeError:
+                existing = []
+
+    combined = (feed_entries + existing)[:500]
+    # Atomic write via temp file + rename: only needs write perm on the
+    # directory, so it works even if an existing feed file is owned by
+    # another user (e.g. root), and readers never see a half-written file.
+    tmp_path = feed_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(combined, f, indent=2)
+    os.replace(tmp_path, feed_path)
+
+    print(f"Wrote {len(feed_entries)} signals to {feed_path}")
 
 # ============================================
 # SUGGESTED ENTRY/EXIT PRICES (3 TARGETS)
@@ -529,10 +406,12 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
     
     if rsi_1h is not None:
         if signal_type.startswith('SELL') and rsi_1h < 30:
-            adjustment_pct = ((30 - rsi_1h) / 30) * 0.02
+            # 1h oversold - only sell on a bounce (higher price)
+            adjustment_pct = ((30 - rsi_1h) / 30) * 0.02  # Up to 2% higher
             entry_adjustment = price * adjustment_pct
         elif signal_type.startswith('BUY') and rsi_1h > 70:
-            adjustment_pct = ((rsi_1h - 70) / 30) * 0.02
+            # 1h overbought - only buy on a dip (lower price)
+            adjustment_pct = ((rsi_1h - 70) / 30) * 0.02  # Up to 2% lower
             entry_adjustment = -price * adjustment_pct
     
     adjusted_entry = price + entry_adjustment
@@ -597,7 +476,7 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
 # ENHANCED SIGNAL DETECTION WITH HIGHER TIMEFRAME OVERRULE
 # ============================================
 
-def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is_metal=False, btc_state='neutral', btc_change=0, btc_tf='unknown'):
+def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
     current = price[-1]
     prev = price[-2]
     signals = []
@@ -673,8 +552,8 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
         filters_triggered = []
         skip_signal = False
         
-        # FILTER 1: Volume Analysis (SKIP FOR METALS)
-        if not is_metal and len(volume) > 15:
+        # FILTER 1: Volume Analysis
+        if len(volume) > 15:
             avg_volume = np.mean(volume[-15:])
             current_volume = volume[-1]
             volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
@@ -705,8 +584,6 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
                 filters_triggered.append(f"📈 Volume {volume_ratio:.1f}x avg")
             else:
                 filters_triggered.append(f"📉 Volume {volume_ratio:.1f}x avg")
-        elif is_metal:
-            filters_triggered.append(f"💰 Metal: Volume filter bypassed")
         
         # FILTER 2: MA Trend Alignment
         if len(price) > ma_period:
@@ -809,30 +686,6 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
                     filters_triggered.append(f"⚠️ 1h RSI {rsi_1h} (overbought) - reduce confidence")
         
         # ============================================
-        # FILTER 7: BITCOIN MARKET FILTER
-        # ============================================
-        # Apply BTC filter (only for non-BTC, non-metal symbols)
-        # Metals (XAU/XAG) are NOT correlated with BTC
-        if (symbol != 'BTC/USDT' and 
-            symbol not in METAL_SYMBOLS and 
-            btc_state != 'neutral'):
-            new_signal, btc_confidence_adj, btc_message = apply_btc_filter_higher_tf(
-                signal['type'], confidence, btc_state, btc_change, btc_tf
-            )
-            
-            # Update signal type and confidence
-            if new_signal != signal['type']:
-                signal['type'] = new_signal
-                signal['description'] = f"{signal['description']} (REVERSED by BTC filter)"
-                filters_triggered.append(btc_message)
-            
-            confidence += btc_confidence_adj
-            filters_triggered.append(f"BTC filter: {btc_message}")
-        elif symbol in METAL_SYMBOLS:
-            # Metals are independent of BTC - skip BTC filter
-            filters_triggered.append("💰 Metal: BTC filter bypassed (independent asset)")
-        
-        # ============================================
         # FINAL CONFIDENCE CALCULATION
         # ============================================
         confidence = max(0, min(100, confidence))
@@ -847,7 +700,7 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
                 'description': signal['description'],
                 'filters': filters_triggered,
                 'base_confidence': signal['base_confidence'],
-                'rsi_1h': rsi_1h
+                'rsi_1h': rsi_1h  # Pass through for entry adjustment
             })
     
     enhanced_signals.sort(key=lambda x: x['confidence'], reverse=True)
@@ -857,56 +710,30 @@ def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params, is
 # MAIN SCAN FUNCTION
 # ============================================
 
-def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positions, use_btc_filter=True, btc_threshold=1.5):
+def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positions):
+    params = get_timeframe_params(timeframe)
     results = []
     
     print(f"\n{'='*110}")
     print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*110}")
     print(f"Account: ${account_size:,} | Risk: {risk_percent*100:.1f}% per trade | Max Positions: {max_positions}")
-    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures (XAU/XAG)")
-    if use_btc_filter:
-        print(f"🐂 Bitcoin Market Filter: ENABLED (threshold: {btc_threshold}%)")
-        print(f"   ⚠️ Metals (XAU/XAG) EXCLUDED from BTC filter (independent assets)")
-        # Check BTC state for display
-        btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=btc_threshold)
-        print(f"   BTC Market State: {btc_state.upper()} ({btc_change:.2f}%) on {btc_tf}")
-    else:
-        print(f"🐂 Bitcoin Market Filter: DISABLED")
+    print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
+    print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
+    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures")
     print(f"{'='*110}\n")
-    
-    # Get BTC market state once for the entire scan
-    btc_state = 'neutral'
-    btc_change = 0.0
-    if use_btc_filter:
-        btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=btc_threshold)
     
     for symbol in SYMBOLS:
         try:
-            is_metal = symbol in METAL_SYMBOLS
-            is_btc = symbol == 'BTC/USDT'
-            
-            # Get parameters (different for metals)
-            params = get_timeframe_params(timeframe, is_metal)
-            
-            # For metals, we need to use the lookback + some buffer
-            lookback_needed = params['lookback']
-            fetch_limit = lookback_needed + 50
-            
-            df = fetch_data(symbol, timeframe, limit=fetch_limit)
-            
-            if df is None or len(df) < max(30, lookback_needed * 0.6):
-                if is_metal:
-                    print(f"⚠️ {symbol}: Only {len(df) if df is not None else 0} bars (needs ~{lookback_needed * 0.6:.0f} for metal)")
+            df = fetch_data(symbol, timeframe, params['lookback'] + 50)
+            if df is None or len(df) < params['lookback']:
                 continue
             
             close = df['close'].values
             volume = df['volume'].values
             
-            # If we don't have enough bars for the full lookback, use what we have
-            actual_lookback = min(lookback_needed, len(close))
             mid, upper, lower = nadaraya_watson_envelope(
-                close, params['bandwidth'], params['multiplier'], actual_lookback
+                close, params['bandwidth'], params['multiplier'], params['lookback']
             )
             
             if mid is None:
@@ -915,17 +742,8 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             rsi_val = rsi(close[-params['rsi_period']-30:], params['rsi_period'])
             current_price = close[-1]
             
-            # For BTC, we don't apply BTC filter to itself
-            if is_btc:
-                btc_state_for_symbol = 'neutral'
-                btc_change_for_symbol = 0.0
-            else:
-                btc_state_for_symbol = btc_state
-                btc_change_for_symbol = btc_change
-            
             signals = detect_signals(
-                close, volume, rsi_val, lower, upper, mid, symbol, params, is_metal,
-                btc_state_for_symbol, btc_change_for_symbol
+                close, volume, rsi_val, lower, upper, mid, symbol, params
             )
             
             if signals:
@@ -934,12 +752,12 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
                 entry_exit = calculate_entry_exit(
                     current_price, lower, upper, mid,
                     best['type'], best['confidence'], rsi_val, params,
-                    rsi_1h=best.get('rsi_1h')
+                    rsi_1h=best.get('rsi_1h')  # Pass the 1h RSI for entry adjustment
                 )
                 
                 position_size = calculate_position_size(
                     current_price, entry_exit['stop_loss'], best['confidence'],
-                    account_size, risk_percent, is_metal
+                    account_size, risk_percent
                 )
                 
                 position = "Inside"
@@ -1080,6 +898,10 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             print(f"      TP1: ${row['tp1']:.4f} | TP2: ${row['tp2']:.4f} | TP3: ${row['tp3']:.4f}")
     
     print(f"{'='*110}")
+
+    # Write detected signals to the feed
+    write_to_feed(signals_df.to_dict('records'), timeframe)
+
     return df_results
 
 # ============================================
@@ -1124,11 +946,6 @@ def main():
     print(f"   Max positions: {args.max_positions}")
     if args.verbose:
         print("   Verbose mode: ON (showing all symbols)")
-    if args.no_btc_filter:
-        print("   Bitcoin Market Filter: DISABLED")
-    else:
-        print(f"   Bitcoin Market Filter: ENABLED (threshold: {args.btc_threshold}%)")
-    print(f"   Metals: XAU/XAG with reduced lookback ({get_timeframe_params(args.timeframe, True)['lookback']} bars)")
     
     start_time = time.time()
     results = scan_with_signals(
@@ -1136,9 +953,7 @@ def main():
         args.verbose,
         args.account_size,
         args.risk,
-        args.max_positions,
-        use_btc_filter=not args.no_btc_filter,
-        btc_threshold=args.btc_threshold
+        args.max_positions
     )
     elapsed = time.time() - start_time
     

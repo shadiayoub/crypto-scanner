@@ -4,3 +4,4 @@ bkp.scanner.py
 logs/
 data/
 __pycache__/
+btc-dom-scanner.py
