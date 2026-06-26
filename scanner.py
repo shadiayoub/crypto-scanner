@@ -281,6 +281,76 @@ def check_timeframe_confirmation(symbol, timeframe, rsi_period, rsi_threshold=35
     return confirms, round(rsi_val, 2)
 
 # ============================================
+# BTC MARKET STATE (DISPLAY ONLY - NO SIGNAL IMPACT)
+# ============================================
+
+def get_btc_market_state_higher_tf(timeframe, threshold=1.5):
+    """
+    Analyze Bitcoin's trend using HIGHER TIMEFRAMES
+    Returns: (state, change_pct, timeframe_used)
+    This is for DISPLAY ONLY and does NOT affect signal handling
+    """
+    try:
+        # Determine which higher timeframe to use
+        if timeframe in ['1m', '5m', '15m']:
+            # For short-term signals, check 1h and 4h
+            tfs_to_check = ['1h', '4h']
+        elif timeframe in ['30m', '1h']:
+            # For medium-term signals, check 4h and 1d
+            tfs_to_check = ['4h', '1d']
+        else:
+            # For long-term signals, check 1d
+            tfs_to_check = ['1d']
+        
+        states = []
+        changes = []
+        
+        for tf in tfs_to_check:
+            df = fetch_data('BTC/USDT', tf, limit=20)
+            if df is None or len(df) < 10:
+                continue
+            
+            close = df['close'].values
+            current_price = close[-1]
+            price_5_ago = close[-5] if len(close) >= 5 else current_price
+            price_10_ago = close[-10] if len(close) >= 10 else current_price
+            
+            # Calculate changes
+            change_5 = ((current_price - price_5_ago) / price_5_ago) * 100
+            change_10 = ((current_price - price_10_ago) / price_10_ago) * 100
+            avg_change = (change_5 + change_10) / 2
+            
+            # Determine state for this timeframe
+            if avg_change > threshold * 2:
+                state = 'STRONG_BULLISH'
+            elif avg_change > threshold:
+                state = 'BULLISH'
+            elif avg_change < -threshold * 2:
+                state = 'STRONG_BEARISH'
+            elif avg_change < -threshold:
+                state = 'BEARISH'
+            else:
+                state = 'NEUTRAL'
+            
+            states.append(state)
+            changes.append(avg_change)
+        
+        # If we have multiple timeframes, use the more bearish/bullish one
+        if len(states) >= 2:
+            priority = {'STRONG_BEARISH': 0, 'BEARISH': 1, 'NEUTRAL': 2, 'BULLISH': 3, 'STRONG_BULLISH': 4}
+            worst_state = min(states, key=lambda x: priority.get(x, 2))
+            worst_change = changes[states.index(worst_state)]
+            return worst_state, worst_change, tfs_to_check[0]
+        elif len(states) == 1:
+            return states[0], changes[0], tfs_to_check[0]
+        else:
+            return 'NEUTRAL', 0.0, 'unknown'
+        
+    except Exception as e:
+        print(f"⚠️ BTC state check error: {str(e)[:60]}")
+        return 'NEUTRAL', 0.0, 'unknown'
+
+# ============================================
 # POSITION SIZING CALCULATOR
 # ============================================
 
@@ -315,8 +385,11 @@ def calculate_position_size(price, stop_loss, confidence, account_size, risk_per
 # FEED WRITER
 # ============================================
 
-def write_to_feed(signals, timeframe, feed_path="/home/algo/algo/data/rsi_alerts.json"):
+def write_to_feed(signals, timeframe, feed_path="./data/rsi_alerts.json"):
     """Append detected signals to the rsi_alerts.json file."""
+    if not signals:
+        return
+    
     feed_entries = []
     for sig in signals:
         # Normalize confidence from 0-100 to 0-6 scale
@@ -350,8 +423,16 @@ def write_to_feed(signals, timeframe, feed_path="/home/algo/algo/data/rsi_alerts
         }
         feed_entries.append(entry)
 
+    if not feed_entries:
+        return
+
     # Read existing feed, prepend new entries
-    os.makedirs(os.path.dirname(feed_path), exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(feed_path), exist_ok=True)
+    except (PermissionError, OSError):
+        # If we can't create the directory, use current directory
+        feed_path = "./rsi_alerts.json"
+    
     existing = []
     if os.path.exists(feed_path):
         with open(feed_path, "r") as f:
@@ -361,15 +442,15 @@ def write_to_feed(signals, timeframe, feed_path="/home/algo/algo/data/rsi_alerts
                 existing = []
 
     combined = (feed_entries + existing)[:500]
-    # Atomic write via temp file + rename: only needs write perm on the
-    # directory, so it works even if an existing feed file is owned by
-    # another user (e.g. root), and readers never see a half-written file.
+    # Atomic write via temp file + rename
     tmp_path = feed_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(combined, f, indent=2)
-    os.replace(tmp_path, feed_path)
-
-    print(f"Wrote {len(feed_entries)} signals to {feed_path}")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(combined, f, indent=2)
+        os.replace(tmp_path, feed_path)
+        print(f"✅ Wrote {len(feed_entries)} signals to {feed_path}")
+    except (PermissionError, OSError) as e:
+        print(f"⚠️ Could not write to feed: {e}")
 
 # ============================================
 # SUGGESTED ENTRY/EXIT PRICES (3 TARGETS)
@@ -714,6 +795,9 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     params = get_timeframe_params(timeframe)
     results = []
     
+    # Get BTC market state for display (does NOT affect signals)
+    btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=1.5)
+    
     print(f"\n{'='*110}")
     print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*110}")
@@ -721,6 +805,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
     print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
     print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures")
+    print(f"BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf} (DISPLAY ONLY - does not affect signals)")
     print(f"{'='*110}\n")
     
     for symbol in SYMBOLS:
@@ -901,6 +986,9 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
 
     # Write detected signals to the feed
     write_to_feed(signals_df.to_dict('records'), timeframe)
+
+    # Display BTC state again after scan
+    print(f"\n📊 Final BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
 
     return df_results
 
