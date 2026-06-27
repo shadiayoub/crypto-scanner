@@ -18,7 +18,7 @@ scanner-bot/
 
 ## 🎯 Overview
 
-This scanner automatically detects **mean-reversion trading opportunities** across 58+ assets (56 cryptocurrencies + 2 precious metals) using advanced statistical methods. It provides:
+This scanner automatically detects **mean-reversion trading opportunities** across 53 assets (51 cryptocurrencies + 2 precious metals) using advanced statistical methods. It provides:
 
 - 📈 **Real-time signal detection** with confidence scoring
 - 💰 **Automated position sizing** based on account risk
@@ -83,7 +83,7 @@ Shows FVG price range in filters.
 - **Risk-based sizing** (adjustable per timeframe)
 - **Confidence scaling** (0.5x - 1.5x position size)
 - **3 Take-Profit targets** (conservative → aggressive)
-- **Max position cap** (30-50% of account)
+- **Max position cap** (50% of account)
 
 ### Output
 - **Signal Summary** table with all detected signals
@@ -103,7 +103,7 @@ cd scanner-bot
 
 ### 2. Install Dependencies
 ```bash
-pip install ccxt pandas numpy smc-toolkit
+pip install ccxt pandas numpy
 ```
 
 ### 3. Ready to Use
@@ -181,7 +181,7 @@ The scanner automatically adjusts its parameters based on the chosen timeframe:
 | **1m-15m** | 200 | 3.5 | 2.0 | 8 | 50 | 1.0% | 1.5%/2.5%/4% |
 | **30m** | 300 | 4.5 | 2.5 | 10 | 100 | 1.5% | 2%/3.5%/5% |
 | **1h** | 500 | 6.0 | 3.0 | 14 | 200 | 2.0% | 3%/5%/7% |
-| **2h** | 500 | 6.0 | 3.0 | 14 | 200 | 2.0% | 3%/5%/7% |
+| **2h** | 500 | 8.0 | 4.0 | 14 | 200 | 2.0% | 4%/7%/10% |
 | **4h-6h** | 500 | 7.0 | 3.5 | 14 | 200 | 2.0% | 4%/7%/10% |
 | **12h-1d** | 500 | 8.0 | 4.0 | 14 | 200 | 2.0% | 4%/7%/10% |
 
@@ -210,7 +210,7 @@ The scanner automatically adjusts its parameters based on the chosen timeframe:
 Account: $10,000 | Risk: 1.5% per trade | Max Positions: 5
 Parameters: Bandwidth=3.5, Multiplier=2.0, RSI=8
 Confirmation: 1h | MA50 | Targets: 1.5%/2.5%/4.0%
-Symbols: 56 Spot + 2 Futures
+Symbols: 51 Spot + 2 Futures
 ==============================================================================================================
 
 SYMBOL          PRICE      SIGNAL             CONF   RSI      POSITION        FILTERS
@@ -233,7 +233,7 @@ XAU/USDT:USDT   $4074.40   🔴 SELL_OVERBOUGHT  61.2%  68.42    Above Upper    
    🔍 Filters: 🔥 Volume 2.1x avg, ✅ Above MA50 ($62200.00), ✅ 1h confirms (RSI 32.15)
 
 ==============================================================================================================
-SUMMARY: 2 BUY | 1 SELL | 55 NEUTRAL | 58 TOTAL
+SUMMARY: 2 BUY | 1 SELL | 50 NEUTRAL | 53 TOTAL
 ==============================================================================================================
 ```
 
@@ -247,8 +247,8 @@ SUMMARY: 2 BUY | 1 SELL | 55 NEUTRAL | 58 TOTAL
 | **SELL_CROSS** | Price crosses below upper band + RSI > 55 | Bearish reversal confirmed |
 | **BUY_OVERSOLD** | RSI < 35 + Price near lower band | Oversold bounce opportunity |
 | **SELL_OVERBOUGHT** | RSI > 65 + Price near upper band | Overbought drop opportunity |
-| **EXTREME_OVERSOLD** | Price >2% below lower band | Capitulation level |
-| **EXTREME_OVERBOUGHT** | Price >2% above upper band | Exhaustion level |
+| **BUY_EXTREME_OVERSOLD** | Price >2% below lower band | Capitulation level |
+| **SELL_EXTREME_OVERBOUGHT** | Price >2% above upper band | Exhaustion level |
 
 ---
 
@@ -305,15 +305,15 @@ SUMMARY: 2 BUY | 1 SELL | 55 NEUTRAL | 58 TOTAL
 
 ### Position Management
 - **Max concurrent positions**: 3-8 depending on timeframe
-- **Max per position**: 30-50% of account
+- **Max per position**: 50% of account
 - **Risk per trade**: 1-2% of account (adjustable via CLI)
 
 ---
 
 ## 🧪 Supported Assets
 
-### Cryptocurrencies (56)
-BTC, ETH, SOL, XRP, DOGE, LINK, AVAX, SUI, NEAR, WIF, ARB, OP, AAVE, ADA, AIXBT, ALGO, APT, ASTER, ATOM, BCH, BNB, BONK, CRV, DOT, ETC, FIL, HBAR, INJ, JTO, JUP, KAITO, LDO, LIT, LTC, ONDO, ORDI, PENGU, PNUT, POL, PUMP, RENDER, S, SHIB, STX, TAO, TIA, TRUMP, TRX, UNI, VIRTUAL, WLD, ZEC
+### Cryptocurrencies (51)
+BTC, ETH, SOL, XRP, DOGE, LINK, AVAX, SUI, NEAR, WIF, ARB, OP, AAVE, ADA, AIXBT, ALGO, APT, ASTER, ATOM, BCH, BNB, BONK, CRV, DOT, ETC, FIL, HBAR, INJ, JTO, JUP, KAITO, LDO, LIT, LTC, ONDO, ORDI, PENGU, PNUT, POL, PUMP, RENDER, S, SHIB, STX, TAO, TIA, TRX, UNI, VIRTUAL, WLD, ZEC
 
 ### Precious Metals (2)
 - **XAU/USDT:USDT** (Gold Perpetual)
@@ -328,11 +328,14 @@ BTC, ETH, SOL, XRP, DOGE, LINK, AVAX, SUI, NEAR, WIF, ARB, OP, AAVE, ADA, AIXBT,
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `-tf, --timeframe` | Timeframe to scan | `1h` |
-| `-v, --verbose` | Show all symbols | `False` |
-| `--list-timeframes` | Show available timeframes | - |
+| `-v, --verbose` | Show all symbols, not just signals | `False` |
+| `--list-timeframes` | Print available timeframes and exit | - |
 | `--account-size` | Account size in USD | `10000` |
-| `--risk` | Risk per trade (%) | `0.02` |
+| `--risk` | Risk per trade (decimal, e.g. 0.02 = 2%) | `0.02` |
 | `--max-positions` | Max concurrent positions | `3` |
+| `--no-squeeze` | Disable Squeeze Momentum filter | `False` |
+| `--no-smre` | Disable SMRE Statistical filter | `False` |
+| `--no-smc` | Disable Smart Money Concepts filter | `False` |
 
 ### Example: Custom Configuration
 ```bash
@@ -345,6 +348,7 @@ python scanner.py -tf 15m --account-size 50000 --risk 0.015 --max-positions 5 -v
 
 | Version | Changes |
 |---------|---------|
+| **v3.1** | Bug fixes: Wilder's RSI smoothing, corrected Hurst exponent, squeeze release logic, BUY_/SELL_ extreme signal prefixes, directional HTF confirmation, removed broken smc-toolkit dependency (built-in SMC), USDT symbol normalisation, UTC timestamp |
 | **v3.0** | Unified scanner with CLI arguments, 3 TP targets, enhanced filters |
 | **v2.0** | Short-term version added (5m-30m) |
 | **v1.0** | Long-term version (1H) |
