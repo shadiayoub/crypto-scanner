@@ -37,11 +37,19 @@ This scanner automatically detects **mean-reversion trading opportunities** acro
 - **58+ Assets**: Top cryptocurrencies + Gold (XAU) & Silver (XAG) futures
 
 ### Filter System
-| Filter | Impact | Description |
-|--------|--------|-------------|
+*Note: The **BTC filter** state is displayed for context only and does not affect signal generation.*
+
+Signals are generated purely based on the following components:
+
+| Filter / Indicator | Impact | Description |
+|--------------------|--------|-------------|
+| **Nadaraya-Watson Envelope** | Core | Primary mean-reversion boundary detection |
+| **RSI** | Core | Momentum confirmation |
 | **Volume** | +6-12% | Confirms unusual trading activity with direction analysis |
 | **MA Trend** | +8% or -15% | Aligns signals with trend (MA50 or MA200 depending on TF) |
 | **Timeframe Confirmation** | +15% or -15% | Higher/lower timeframe alignment |
+| **Squeeze Momentum (NEW)** | Modifies | Identifies periods of consolidation before a breakout |
+| **SMRE Statistical Filters (NEW)** | Modifies | Advanced statistical filtering for enhanced accuracy |
 | **RSI Divergence** | -20% | Detects RSI/Price mismatches |
 | **Price Velocity** | -15% | Filters capitulation/blow-off moves |
 
@@ -232,10 +240,12 @@ SUMMARY: 2 BUY | 1 SELL | 55 NEUTRAL | 58 TOTAL
 
 ### 3. Signal Detection
 - Scans for multiple signal types simultaneously
-- Applies 5 filters to adjust confidence:
+- Applies multiple filters and indicators to adjust confidence:
   - Volume analysis (with direction detection)
   - MA trend alignment
   - Timeframe confirmation
+  - Squeeze Momentum (NEW)
+  - SMRE Statistical Filters (NEW)
   - RSI divergence check
   - Price velocity filter
 - Only signals with confidence > 50% are shown
