@@ -2,7 +2,6 @@
 """
 Multi-Asset Scanner with Nadaraya-Watson Envelope
 Supports both long-term and short-term timeframes via command-line arguments
-Includes Squeeze Momentum and Statistical Mean-Reversion Engine (SMRE) filters
 
 Usage:
     python scanner.py                    # Default: 1h timeframe
@@ -83,18 +82,6 @@ Examples:
         type=int,
         default=3,
         help='Maximum concurrent positions (default: 3)'
-    )
-    
-    parser.add_argument(
-        '--no-squeeze',
-        action='store_true',
-        help='Disable Squeeze Momentum filter'
-    )
-    
-    parser.add_argument(
-        '--no-smre',
-        action='store_true',
-        help='Disable Statistical Mean-Reversion Engine filter'
     )
     
     return parser.parse_args()
@@ -251,146 +238,8 @@ def rsi(price, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ============================================
-# SQUEEZE MOMENTUM INDICATOR
-# ============================================
-
-def squeeze_momentum(high, low, close, bb_period=20, bb_mult=2, kc_period=20, kc_mult=1.5):
-    """
-    Calculates Squeeze Momentum (LazyBear style)
-    Returns: (squeeze_on, momentum_value, squeeze_release)
-    """
-    # Bollinger Bands
-    sma = np.mean(close[-bb_period:])
-    std = np.std(close[-bb_period:])
-    bb_upper = sma + (bb_mult * std)
-    bb_lower = sma - (bb_mult * std)
-    
-    # Keltner Channels
-    tr = np.zeros(len(close))
-    for i in range(1, len(close)):
-        tr[i] = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
-    atr = np.mean(tr[-kc_period:])
-    kc_upper = sma + (kc_mult * atr)
-    kc_lower = sma - (kc_mult * atr)
-    
-    # Squeeze condition: BB inside KC
-    squeeze_on = (bb_upper < kc_upper) and (bb_lower > kc_lower)
-    
-    # Momentum: price relative to bands
-    # Using CMO (Chande Momentum Oscillator) style calculation
-    if len(close) > 20:
-        momentum = ((close[-1] - sma) / (sma * 0.01)) * 0.5  # Scaled momentum
-    else:
-        momentum = 0
-    
-    # Squeeze release: price breaks out of squeeze
-    squeeze_release = False
-    if len(close) > 2:
-        if squeeze_on:
-            if close[-1] > close[-2] and close[-1] > kc_upper:
-                squeeze_release = True
-            elif close[-1] < close[-2] and close[-1] < kc_lower:
-                squeeze_release = True
-    
-    return squeeze_on, momentum, squeeze_release
-
-# ============================================
-# STATISTICAL MEAN-REVERSION ENGINE (SMRE)
-# ============================================
-
-def smre_filter(price, window=50, threshold=2.0):
-    """
-    Statistical Mean-Reversion Engine (SMRE)
-    Tests if price is in a mean-reverting regime
-    Returns: (is_mean_reverting, z_score, confidence)
-    """
-    if len(price) < window:
-        return False, 0, 0
-    
-    # Calculate rolling mean and std
-    mean_val = np.mean(price[-window:])
-    std_val = np.std(price[-window:])
-    
-    if std_val == 0:
-        return False, 0, 0
-    
-    # Z-score of current price
-    z_score = (price[-1] - mean_val) / std_val
-    
-    # Mean-reversion confidence (higher when extreme)
-    confidence = min(100, abs(z_score) / threshold * 100)
-    
-    # Check if in mean-reverting regime
-    # 1. Price is at extremes (z_score > threshold)
-    # 2. Not in a strong trend (ADX test)
-    is_mean_reverting = abs(z_score) > threshold
-    
-    return is_mean_reverting, z_score, confidence
-
-def stationarity_test(price, window=100):
-    """
-    Simplified stationarity test using Hurst exponent approximation
-    Returns: (is_stationary, hurst)
-    """
-    if len(price) < window:
-        return False, 0.5
-    
-    # Hurst exponent approximation (simplified)
-    log_returns = np.diff(np.log(price[-window:]))
-    if len(log_returns) < 2:
-        return False, 0.5
-    
-    # Variance ratio test (simplified)
-    var1 = np.var(log_returns)
-    var2 = np.var(log_returns[::2])
-    
-    if var1 > 0:
-        ratio = var2 / var1
-        hurst = 0.5 * ratio
-        hurst = max(0, min(1, hurst))
-    else:
-        hurst = 0.5
-    
-    # Stationary if Hurst < 0.5 (mean-reverting)
-    is_stationary = hurst < 0.5
-    
-    return is_stationary, round(hurst, 2)
-
-def volatility_regime(price, window=50):
-    """
-    Classifies volatility regime
-    Returns: ('low', 'medium', 'high'), vol_score
-    """
-    if len(price) < window:
-        return 'medium', 50
-    
-    returns = np.diff(price[-window:])
-    if len(returns) < 2:
-        return 'medium', 50
-    
-    current_vol = np.std(returns)
-    avg_vol = np.std(np.diff(price[-window*2:])) if len(price) > window*2 else current_vol
-    
-    if avg_vol == 0:
-        return 'medium', 50
-    
-    vol_ratio = current_vol / avg_vol
-    vol_score = min(100, vol_ratio * 50)
-    
-    if vol_ratio < 0.7:
-        regime = 'low'
-    elif vol_ratio < 1.3:
-        regime = 'medium'
-    else:
-        regime = 'high'
-    
-    return regime, round(vol_score, 1)
-
-# ============================================
-# CACHED EXCHANGE
-# ============================================
-
+# Cached exchange instances so load_markets() runs once per process,
+# not once per fetch_data() call (~4s -> ~0.27s per fetch).
 _EXCHANGES = {}
 
 def get_exchange(is_futures):
@@ -432,16 +281,25 @@ def check_timeframe_confirmation(symbol, timeframe, rsi_period, rsi_threshold=35
     return confirms, round(rsi_val, 2)
 
 # ============================================
-# BTC MARKET STATE (DISPLAY ONLY)
+# BTC MARKET STATE (DISPLAY ONLY - NO SIGNAL IMPACT)
 # ============================================
 
 def get_btc_market_state_higher_tf(timeframe, threshold=1.5):
+    """
+    Analyze Bitcoin's trend using HIGHER TIMEFRAMES
+    Returns: (state, change_pct, timeframe_used)
+    This is for DISPLAY ONLY and does NOT affect signal handling
+    """
     try:
+        # Determine which higher timeframe to use
         if timeframe in ['1m', '5m', '15m']:
+            # For short-term signals, check 1h and 4h
             tfs_to_check = ['1h', '4h']
         elif timeframe in ['30m', '1h']:
+            # For medium-term signals, check 4h and 1d
             tfs_to_check = ['4h', '1d']
         else:
+            # For long-term signals, check 1d
             tfs_to_check = ['1d']
         
         states = []
@@ -457,10 +315,12 @@ def get_btc_market_state_higher_tf(timeframe, threshold=1.5):
             price_5_ago = close[-5] if len(close) >= 5 else current_price
             price_10_ago = close[-10] if len(close) >= 10 else current_price
             
+            # Calculate changes
             change_5 = ((current_price - price_5_ago) / price_5_ago) * 100
             change_10 = ((current_price - price_10_ago) / price_10_ago) * 100
             avg_change = (change_5 + change_10) / 2
             
+            # Determine state for this timeframe
             if avg_change > threshold * 2:
                 state = 'STRONG_BULLISH'
             elif avg_change > threshold:
@@ -475,6 +335,7 @@ def get_btc_market_state_higher_tf(timeframe, threshold=1.5):
             states.append(state)
             changes.append(avg_change)
         
+        # If we have multiple timeframes, use the more bearish/bullish one
         if len(states) >= 2:
             priority = {'STRONG_BEARISH': 0, 'BEARISH': 1, 'NEUTRAL': 2, 'BULLISH': 3, 'STRONG_BULLISH': 4}
             worst_state = min(states, key=lambda x: priority.get(x, 2))
@@ -525,19 +386,25 @@ def calculate_position_size(price, stop_loss, confidence, account_size, risk_per
 # ============================================
 
 def write_to_feed(signals, timeframe, feed_path="./data/rsi_alerts.json"):
+    """Append detected signals to the rsi_alerts.json file."""
     if not signals:
         return
     
     feed_entries = []
     for sig in signals:
+        # Normalize confidence from 0-100 to 0-6 scale
         conf = round(sig["confidence"] / 100 * 6, 1)
+
+        # Map direction
         direction = "buy" if "BUY" in sig["signal_type"] else "sell"
-        
+
+        # Normalize symbol to DoochyBot format
         raw_symbol = sig["symbol"]
         if ":" in raw_symbol:
-            raw_symbol = raw_symbol.split(":")[0]
+            raw_symbol = raw_symbol.split(":")[0]  # "XAU/USDT:USDT" → "XAU/USDT"
         if "/" in raw_symbol:
-            raw_symbol = raw_symbol.split("/")[0] + "USD"
+            raw_symbol = raw_symbol.split("/")[0] + "USD"  # "XAU/USDT" → "XAUUSD"
+        # Crypto that's already a ticker stays as-is after removing suffix
         symbol = raw_symbol
 
         entry = {
@@ -551,7 +418,7 @@ def write_to_feed(signals, timeframe, feed_path="./data/rsi_alerts.json"):
             "pivot_distance": None,
             "confidence": conf,
             "sl": sig["stop_loss"],
-            "tp": sig["tp1"],
+            "tp": sig["tp1"],  # Use TP1 as primary target
             "signal_source": "signal_scanner"
         }
         feed_entries.append(entry)
@@ -559,9 +426,11 @@ def write_to_feed(signals, timeframe, feed_path="./data/rsi_alerts.json"):
     if not feed_entries:
         return
 
+    # Read existing feed, prepend new entries
     try:
         os.makedirs(os.path.dirname(feed_path), exist_ok=True)
     except (PermissionError, OSError):
+        # If we can't create the directory, use current directory
         feed_path = "./rsi_alerts.json"
     
     existing = []
@@ -573,6 +442,7 @@ def write_to_feed(signals, timeframe, feed_path="./data/rsi_alerts.json"):
                 existing = []
 
     combined = (feed_entries + existing)[:500]
+    # Atomic write via temp file + rename
     tmp_path = feed_path + ".tmp"
     try:
         with open(tmp_path, "w") as f:
@@ -587,6 +457,10 @@ def write_to_feed(signals, timeframe, feed_path="./data/rsi_alerts.json"):
 # ============================================
 
 def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_val, params, rsi_1h=None):
+    """
+    Calculate suggested entry, stop loss, and take profit levels
+    With entry adjustment for higher timeframe divergence
+    """
     result = {
         'entry': price,
         'stop_loss': None,
@@ -606,14 +480,19 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
     tp2_pct = params['target_2_pct']
     tp3_pct = params['target_3_pct']
     
+    # ============================================
+    # ENTRY PRICE ADJUSTMENT FOR DIVERGENCE
+    # ============================================
     entry_adjustment = 0
     
     if rsi_1h is not None:
         if signal_type.startswith('SELL') and rsi_1h < 30:
-            adjustment_pct = ((30 - rsi_1h) / 30) * 0.02
+            # 1h oversold - only sell on a bounce (higher price)
+            adjustment_pct = ((30 - rsi_1h) / 30) * 0.02  # Up to 2% higher
             entry_adjustment = price * adjustment_pct
         elif signal_type.startswith('BUY') and rsi_1h > 70:
-            adjustment_pct = ((rsi_1h - 70) / 30) * 0.02
+            # 1h overbought - only buy on a dip (lower price)
+            adjustment_pct = ((rsi_1h - 70) / 30) * 0.02  # Up to 2% lower
             entry_adjustment = -price * adjustment_pct
     
     adjusted_entry = price + entry_adjustment
@@ -675,10 +554,10 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
     return result
 
 # ============================================
-# ENHANCED SIGNAL DETECTION WITH SQUEEZE + SMRE
+# ENHANCED SIGNAL DETECTION WITH HIGHER TIMEFRAME OVERRULE
 # ============================================
 
-def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol, params, use_squeeze=True, use_smre=True):
+def detect_signals(price, volume, rsi_val, lower, upper, mid, symbol, params):
     current = price[-1]
     prev = price[-2]
     signals = []
@@ -686,14 +565,6 @@ def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol,
     rsi_period = params['rsi_period']
     ma_period = params['ma_period']
     confirm_tf = params['confirmation_timeframe']
-    
-    # --- CALCULATE SQUEEZE MOMENTUM ---
-    squeeze_on, momentum, squeeze_release = squeeze_momentum(high, low, price)
-    
-    # --- CALCULATE SMRE FILTERS ---
-    is_mean_reverting, z_score, smre_confidence = smre_filter(price)
-    is_stationary, hurst = stationarity_test(price)
-    vol_regime, vol_score = volatility_regime(price)
     
     # 1. CROSSOVER SIGNAL
     if current > lower and prev <= lower and rsi_val < 45:
@@ -749,7 +620,7 @@ def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol,
             })
     
     # ============================================
-    # FETCH HIGHER TIMEFRAME RSI
+    # FETCH HIGHER TIMEFRAME RSI FOR OVERRULE LOGIC
     # ============================================
     confirms_1h, rsi_1h = check_timeframe_confirmation(
         symbol, confirm_tf, rsi_period, rsi_threshold=35
@@ -821,7 +692,7 @@ def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol,
                         confidence -= 10
                         filters_triggered.append(f"⚠️ Far above MA{ma_period}")
         
-        # FILTER 3: Timeframe Confirmation
+        # FILTER 3: Timeframe Confirmation (Standard)
         if confirms_1h is not None:
             if confirms_1h:
                 confidence += 15
@@ -855,93 +726,45 @@ def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol,
                 filters_triggered.append(f"⚠️ Sharp rise {recent_change:.1f}%")
         
         # ============================================
-        # FILTER 6: HIGHER TIMEFRAME OVERRULE
+        # FILTER 6: HIGHER TIMEFRAME OVERRULE LOGIC
         # ============================================
         if rsi_1h is not None:
+            
+            # --- SELL SIGNAL OVERRULE ---
             if signal['type'].startswith('SELL'):
                 if rsi_1h < 30:
                     confidence -= 30
                     filters_triggered.append(f"⚠️ CRITICAL: 1h RSI {rsi_1h} < 30 (oversold) - SELL downgraded")
+                    
                     if rsi_1h < 20:
                         confidence -= 10
                         filters_triggered.append(f"⚠️ EXTREME: 1h RSI {rsi_1h} < 20 - SELL likely false")
+                    
                     if confidence < 40:
                         skip_signal = True
                         filters_triggered.append("❌ Signal skipped - 1h oversold contradicts SELL")
+                
                 elif rsi_1h < 40:
                     confidence -= 15
                     filters_triggered.append(f"⚠️ 1h RSI {rsi_1h} (oversold) - reduce confidence")
             
+            # --- BUY SIGNAL OVERRULE ---
             elif signal['type'].startswith('BUY'):
                 if rsi_1h > 70:
                     confidence -= 30
                     filters_triggered.append(f"⚠️ CRITICAL: 1h RSI {rsi_1h} > 70 (overbought) - BUY downgraded")
+                    
                     if rsi_1h > 80:
                         confidence -= 10
                         filters_triggered.append(f"⚠️ EXTREME: 1h RSI {rsi_1h} > 80 - BUY likely false")
+                    
                     if confidence < 40:
                         skip_signal = True
                         filters_triggered.append("❌ Signal skipped - 1h overbought contradicts BUY")
+                
                 elif rsi_1h > 60:
                     confidence -= 15
                     filters_triggered.append(f"⚠️ 1h RSI {rsi_1h} (overbought) - reduce confidence")
-        
-        # ============================================
-        # FILTER 7: SQUEEZE MOMENTUM (NEW)
-        # ============================================
-        if use_squeeze:
-            if signal['type'].startswith('BUY'):
-                # For BUY signals: want squeeze release to upside
-                if squeeze_release and current > upper:
-                    confidence += 15
-                    filters_triggered.append(f"🔥 SQUEEZE RELEASE (upside)")
-                elif squeeze_on:
-                    # Squeeze is on - waiting for release
-                    filters_triggered.append(f"📊 Squeeze active - waiting for release")
-                else:
-                    # No squeeze - signal is weaker
-                    confidence -= 5
-                    filters_triggered.append(f"⚠️ No squeeze momentum")
-            elif signal['type'].startswith('SELL'):
-                # For SELL signals: want squeeze release to downside
-                if squeeze_release and current < lower:
-                    confidence += 15
-                    filters_triggered.append(f"🔥 SQUEEZE RELEASE (downside)")
-                elif squeeze_on:
-                    filters_triggered.append(f"📊 Squeeze active - waiting for release")
-                else:
-                    confidence -= 5
-                    filters_triggered.append(f"⚠️ No squeeze momentum")
-        
-        # ============================================
-        # FILTER 8: SMRE STATISTICAL FILTERS (NEW)
-        # ============================================
-        if use_smre:
-            # Mean-reversion check: only take signals if price is mean-reverting
-            if not is_mean_reverting:
-                # Price is not at extreme - reduce confidence
-                confidence -= 10
-                filters_triggered.append(f"⚠️ Z-score {z_score:.2f} (not extreme)")
-            else:
-                # Price is at extreme - increase confidence
-                confidence += smre_confidence * 0.1
-                filters_triggered.append(f"✅ Z-score {z_score:.2f} (extreme)")
-            
-            # Stationarity check: ensure market is mean-reverting
-            if is_stationary:
-                confidence += 8
-                filters_triggered.append(f"✅ Stationary (Hurst {hurst:.2f})")
-            else:
-                confidence -= 8
-                filters_triggered.append(f"⚠️ Non-stationary (Hurst {hurst:.2f})")
-            
-            # Volatility regime adjustment
-            if vol_regime == 'low':
-                confidence += 5
-                filters_triggered.append(f"✅ Low volatility ({vol_score:.0f}%)")
-            elif vol_regime == 'high':
-                confidence -= 10
-                filters_triggered.append(f"⚠️ High volatility ({vol_score:.0f}%) - reduce size")
         
         # ============================================
         # FINAL CONFIDENCE CALCULATION
@@ -958,12 +781,7 @@ def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol,
                 'description': signal['description'],
                 'filters': filters_triggered,
                 'base_confidence': signal['base_confidence'],
-                'rsi_1h': rsi_1h,
-                'squeeze_on': squeeze_on,
-                'squeeze_release': squeeze_release,
-                'z_score': round(z_score, 2),
-                'hurst': hurst,
-                'vol_regime': vol_regime
+                'rsi_1h': rsi_1h  # Pass through for entry adjustment
             })
     
     enhanced_signals.sort(key=lambda x: x['confidence'], reverse=True)
@@ -973,11 +791,11 @@ def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol,
 # MAIN SCAN FUNCTION
 # ============================================
 
-def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positions, use_squeeze=True, use_smre=True):
+def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positions):
     params = get_timeframe_params(timeframe)
     results = []
     
-    # Get BTC market state for display
+    # Get BTC market state for display (does NOT affect signals)
     btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=1.5)
     
     print(f"\n{'='*110}")
@@ -987,8 +805,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
     print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
     print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures")
-    print(f"BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
-    print(f"Filters: Squeeze={'✅' if use_squeeze else '❌'} | SMRE={'✅' if use_smre else '❌'}")
+    print(f"BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf} (DISPLAY ONLY - does not affect signals)")
     print(f"{'='*110}\n")
     
     for symbol in SYMBOLS:
@@ -998,8 +815,6 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
                 continue
             
             close = df['close'].values
-            high = df['high'].values
-            low = df['low'].values
             volume = df['volume'].values
             
             mid, upper, lower = nadaraya_watson_envelope(
@@ -1013,8 +828,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             current_price = close[-1]
             
             signals = detect_signals(
-                close, high, low, volume, rsi_val, lower, upper, mid, symbol, params,
-                use_squeeze=use_squeeze, use_smre=use_smre
+                close, volume, rsi_val, lower, upper, mid, symbol, params
             )
             
             if signals:
@@ -1023,7 +837,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
                 entry_exit = calculate_entry_exit(
                     current_price, lower, upper, mid,
                     best['type'], best['confidence'], rsi_val, params,
-                    rsi_1h=best.get('rsi_1h')
+                    rsi_1h=best.get('rsi_1h')  # Pass the 1h RSI for entry adjustment
                 )
                 
                 position_size = calculate_position_size(
@@ -1037,28 +851,13 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
                 elif current_price > upper:
                     position = "Above Upper"
                 
-                # Build filter string with new indicators
-                filter_parts = []
-                if best.get('filters'):
-                    filter_parts.extend(best['filters'])
-                if 'squeeze_on' in best:
-                    filter_parts.append(f"Squeeze: {'ON' if best['squeeze_on'] else 'OFF'}")
-                if 'squeeze_release' in best and best['squeeze_release']:
-                    filter_parts.append("🔥 RELEASE")
-                if 'z_score' in best:
-                    filter_parts.append(f"Z: {best['z_score']:.2f}")
-                if 'hurst' in best:
-                    filter_parts.append(f"H: {best['hurst']:.2f}")
-                if 'vol_regime' in best:
-                    filter_parts.append(f"Vol: {best['vol_regime']}")
-                
                 results.append({
                     'symbol': symbol,
                     'price': current_price,
                     'signal_type': best['type'],
                     'confidence': best['confidence'],
                     'description': best['description'],
-                    'filters': ', '.join(filter_parts) if filter_parts else 'None',
+                    'filters': ', '.join(best['filters']) if best['filters'] else 'None',
                     'rsi': round(rsi_val, 2),
                     'lower': round(lower, 2),
                     'upper': round(upper, 2),
@@ -1129,7 +928,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     
     df_results = df_results.sort_values('confidence', ascending=False)
     
-    # DISPLAY - Signal Summary
+    # DISPLAY - Signal Summary (always show signals)
     signals_df = df_results[df_results['signal_type'].str.startswith(('BUY', 'SELL'))]
     
     if len(signals_df) > 0:
@@ -1228,21 +1027,13 @@ def main():
         print(f"   Use --list-timeframes for more details")
         sys.exit(1)
     
-    print("🔍 Starting Enhanced Multi-Asset Scanner...")
+    print("🔍 Starting Multi-Asset Scanner...")
     print(f"   Timeframe: {args.timeframe}")
     print(f"   Account: ${args.account_size:,}")
     print(f"   Risk per trade: {args.risk*100:.1f}%")
     print(f"   Max positions: {args.max_positions}")
     if args.verbose:
         print("   Verbose mode: ON (showing all symbols)")
-    if args.no_squeeze:
-        print("   Squeeze Momentum: DISABLED")
-    else:
-        print("   Squeeze Momentum: ENABLED")
-    if args.no_smre:
-        print("   SMRE Filters: DISABLED")
-    else:
-        print("   SMRE Filters: ENABLED")
     
     start_time = time.time()
     results = scan_with_signals(
@@ -1250,9 +1041,7 @@ def main():
         args.verbose,
         args.account_size,
         args.risk,
-        args.max_positions,
-        use_squeeze=not args.no_squeeze,
-        use_smre=not args.no_smre
+        args.max_positions
     )
     elapsed = time.time() - start_time
     
