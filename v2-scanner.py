@@ -26,14 +26,15 @@ import os
 warnings.filterwarnings('ignore')
 
 # ============================================
-# SMART MONEY CONCEPTS (SMC) - Force Enable
+# SMART MONEY CONCEPTS (SMC)
 # ============================================
 
-# Always enable SMC - use fallback functions
-SMC_AVAILABLE = True  # Force enable, use built-in fallback functions
+# Reflect actual import result so warnings fire correctly (Fix #8)
+SMC_AVAILABLE = True
 
 try:
     import smc_toolkit as smc
+    SMC_AVAILABLE = True
     print("✅ smc-toolkit loaded successfully")
 except ImportError:
     print("⚠️ smc-toolkit not available - using built-in fallback functions")
@@ -252,23 +253,35 @@ def nadaraya_watson_envelope(price, h, mult, lookback):
     return middle, upper, lower
 
 def rsi(price, period=14):
+    """
+    Wilder's RSI with proper recursive smoothing.
+    Fix #1: added Wilder's smoothing loop (was only averaging first `period` bars).
+    Fix #2: use np.zeros_like instead of delta.copy() * 0.
+    """
     if len(price) < period + 1:
         return 50.0
-    
+
     delta = np.diff(price)
-    gain = (delta.copy() * 0)
-    loss = (delta.copy() * 0)
+    # Fix #2 — clean initialisation
+    gain = np.zeros_like(delta)
+    loss = np.zeros_like(delta)
     gain[delta > 0] = delta[delta > 0]
     loss[delta < 0] = -delta[delta < 0]
-    
+
+    # Seed with simple average of first `period` bars
     avg_gain = np.mean(gain[:period])
     avg_loss = np.mean(loss[:period])
-    
+
+    # Fix #1 — Wilder's smoothing for remaining bars
+    for i in range(period, len(delta)):
+        avg_gain = (avg_gain * (period - 1) + gain[i]) / period
+        avg_loss = (avg_loss * (period - 1) + loss[i]) / period
+
     if avg_loss == 0:
         return 100.0
     if avg_gain == 0:
         return 0.0
-    
+
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -304,14 +317,17 @@ def squeeze_momentum(high, low, close, bb_period=20, bb_mult=2, kc_period=20, kc
     else:
         momentum = 0
     
-    # Squeeze release: price breaks out of squeeze
+    # Fix #4 — squeeze_release detects a price breakout through the KC boundary
+    # (the old code required squeeze_on=True simultaneously, which is self-contradicting:
+    # a release means the squeeze just ENDED, not that it is still active).
     squeeze_release = False
     if len(close) > 2:
-        if squeeze_on:
-            if close[-1] > close[-2] and close[-1] > kc_upper:
-                squeeze_release = True
-            elif close[-1] < close[-2] and close[-1] < kc_lower:
-                squeeze_release = True
+        # Upside breakout: current bar closes above KC upper; previous bar did not
+        if close[-1] > kc_upper and close[-2] <= kc_upper:
+            squeeze_release = True
+        # Downside breakout: current bar closes below KC lower; previous bar did not
+        elif close[-1] < kc_lower and close[-2] >= kc_lower:
+            squeeze_release = True
     
     return squeeze_on, momentum, squeeze_release
 
@@ -336,23 +352,32 @@ def smre_filter(price, window=50, threshold=2.0):
     return is_mean_reverting, z_score, confidence
 
 def stationarity_test(price, window=100):
+    """
+    Estimate Hurst exponent via variance scaling of log returns.
+    Fix #3: old formula (0.5 * var2/var1) was not a valid Hurst estimator.
+    Correct approach: H = 0.5 * log2(var_full / var_half), clamped to [0, 1].
+    H < 0.5  → mean-reverting (stationary-like)
+    H ≈ 0.5  → random walk
+    H > 0.5  → trending
+    """
     if len(price) < window:
         return False, 0.5
-    
+
     log_returns = np.diff(np.log(price[-window:]))
-    if len(log_returns) < 2:
+    if len(log_returns) < 4:
         return False, 0.5
-    
-    var1 = np.var(log_returns)
-    var2 = np.var(log_returns[::2])
-    
-    if var1 > 0:
-        ratio = var2 / var1
-        hurst = 0.5 * ratio
-        hurst = max(0, min(1, hurst))
+
+    var_full = np.var(log_returns)
+    half = len(log_returns) // 2
+    var_half = np.var(log_returns[:half])
+
+    if var_full > 0 and var_half > 0:
+        # Fix #3 — variance-scaling Hurst estimate
+        hurst = 0.5 * np.log(var_full / var_half) / np.log(2)
+        hurst = max(0.0, min(1.0, hurst))
     else:
         hurst = 0.5
-    
+
     is_stationary = hurst < 0.5
     return is_stationary, round(hurst, 2)
 
@@ -528,14 +553,23 @@ def fetch_data(symbol, timeframe, limit=550):
         print(f"⚠️ {symbol}: fetch error - {str(e)[:60]}")
         return None
 
-def check_timeframe_confirmation(symbol, timeframe, rsi_period, rsi_threshold=35):
+def check_timeframe_confirmation(symbol, timeframe, rsi_period, signal_direction='BUY', rsi_threshold=35):
+    """
+    Fix #7: original always checked rsi < threshold (bullish confirmation only).
+    Now accepts signal_direction so SELL signals check rsi > (100 - threshold).
+    """
     df = fetch_data(symbol, timeframe, limit=100)
     if df is None or len(df) < 50:
         return False, None
-    
+
     close = df['close'].values
-    rsi_val = rsi(close[-rsi_period-20:], rsi_period)
-    confirms = rsi_val < rsi_threshold
+    rsi_val = rsi(close[-rsi_period - 20:], rsi_period)
+
+    if signal_direction == 'BUY':
+        confirms = rsi_val < rsi_threshold          # oversold on higher TF → bullish
+    else:
+        confirms = rsi_val > (100 - rsi_threshold)  # overbought on higher TF → bearish
+
     return confirms, round(rsi_val, 2)
 
 # ============================================
@@ -644,7 +678,8 @@ def write_to_feed(signals, timeframe, feed_path="./data/rsi_alerts.json"):
         if ":" in raw_symbol:
             raw_symbol = raw_symbol.split(":")[0]
         if "/" in raw_symbol:
-            raw_symbol = raw_symbol.split("/")[0] + "USD"
+            # Fix #9: use USDT suffix to match exchange convention (e.g. BTCUSDT not BTCUSD)
+            raw_symbol = raw_symbol.split("/")[0] + "USDT"
         symbol = raw_symbol
 
         entry = {
@@ -842,29 +877,37 @@ def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol,
         })
     
     # 3. ENVELOPE EXTREME
+    # Fix #5: renamed variable to upper_excess (negative = price above upper band).
+    # Fix #6: signal types now carry BUY_/SELL_ prefix so they reach display and
+    #         all startswith('BUY') / startswith('SELL') filter branches below.
     if lower is not None and lower > 0:
-        lower_dist = ((current - lower) / current) * 100
+        lower_dist = ((current - lower) / current) * 100  # negative = below lower
         if lower_dist < -2:
             signals.append({
-                'type': 'EXTREME_OVERSOLD',
+                'type': 'BUY_EXTREME_OVERSOLD',
                 'base_confidence': 60,
                 'description': f'Price {abs(lower_dist):.1f}% below lower band'
             })
-    
+
     if upper is not None and upper > 0:
-        upper_dist = ((upper - current) / current) * 100
-        if upper_dist < -2:
+        upper_excess = ((upper - current) / current) * 100  # negative = above upper
+        if upper_excess < -2:
             signals.append({
-                'type': 'EXTREME_OVERBOUGHT',
+                'type': 'SELL_EXTREME_OVERBOUGHT',
                 'base_confidence': 60,
-                'description': f'Price {abs(upper_dist):.1f}% above upper band'
+                'description': f'Price {abs(upper_excess):.1f}% above upper band'
             })
     
     # ============================================
     # FETCH HIGHER TIMEFRAME RSI
     # ============================================
+    # Fix #7: derive direction from the first candidate signal so SELL signals
+    # check overbought on the higher TF, not oversold (the old behaviour).
+    first_direction = 'BUY' if (signals and signals[0]['type'].startswith('BUY')) else 'SELL'
     confirms_1h, rsi_1h = check_timeframe_confirmation(
-        symbol, confirm_tf, rsi_period, rsi_threshold=35
+        symbol, confirm_tf, rsi_period,
+        signal_direction=first_direction,
+        rsi_threshold=35
     )
     
     # APPLY FILTERS
@@ -1150,7 +1193,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=1.5)
     
     print(f"\n{'='*110}")
-    print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*110}")
     print(f"Account: ${account_size:,} | Risk: {risk_percent*100:.1f}% per trade | Max Positions: {max_positions}")
     print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")

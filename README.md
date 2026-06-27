@@ -53,6 +53,32 @@ Signals are generated purely based on the following components:
 | **RSI Divergence** | -20% | Detects RSI/Price mismatches |
 | **Price Velocity** | -15% | Filters capitulation/blow-off moves |
 
+## 📊 New SMC Features
+
+### 1. Market Structure Filter
+
+| Structure | BUY Signal Impact | SELL Signal Impact |
+|-----------|-------------------|--------------------|
+| Bullish (BOS UP) | +10% confidence | -15% confidence |
+| Bearish (BOS DOWN) | -15% confidence | +10% confidence |
+| Neutral | No adjustment | No adjustment |
+
+### 2. Order Block Filter
+Identifies the last opposing candle before a strong move.
+
+Adds +8% confidence if price is in an OB zone.
+
+Shows OB price range in filters.
+
+### 3. Fair Value Gap Filter
+Identifies 3-candle gaps (institutional footprints).
+
+Adds +10% confidence if price is in an FVG zone.
+
+Shows FVG price range in filters.
+
+---
+
 ### Position Management
 - **Risk-based sizing** (adjustable per timeframe)
 - **Confidence scaling** (0.5x - 1.5x position size)
@@ -77,7 +103,7 @@ cd scanner-bot
 
 ### 2. Install Dependencies
 ```bash
-pip install ccxt pandas numpy
+pip install ccxt pandas numpy smc-toolkit
 ```
 
 ### 3. Ready to Use
@@ -246,6 +272,9 @@ SUMMARY: 2 BUY | 1 SELL | 55 NEUTRAL | 58 TOTAL
   - Timeframe confirmation
   - Squeeze Momentum (NEW)
   - SMRE Statistical Filters (NEW)
+  - Market Structure Filter (NEW)
+  - Order Block Filter (NEW)
+  - Fair Value Gap Filter (NEW)
   - RSI divergence check
   - Price velocity filter
 - Only signals with confidence > 50% are shown
