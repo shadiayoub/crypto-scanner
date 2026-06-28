@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-BTC Intraday Scanner — 5m / 15m / 30m
-Trend-aware: detects current BTC macro bias (Bearish/Bullish) from 1h+4h,
-then weights signals accordingly so you only trade WITH the dominant move.
+BTC Precision 5m Intraday Scanner (with Order Book Depth, CVD & Volatility Filters)
+Trend-aware: detects current BTC macro bias from 1h+4h and immediate 15m structural trend,
+then combines technical indicators with live order book supply/demand dynamics.
 
 Usage:
-    python btc_scanner.py                  # Scan all timeframes (5m, 15m, 30m)
-    python btc_scanner.py -tf 5m           # 5m only
-    python btc_scanner.py -tf 15m          # 15m only
-    python btc_scanner.py --loop 5         # Repeat every 5 minutes
+    python btc_scanner.py -tf 5m
+    python btc_scanner.py -tf 5m --verbose
 """
 
 import ccxt
@@ -28,13 +26,11 @@ warnings.filterwarnings('ignore')
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='BTC Intraday Scanner — 5m/15m/30m with trend bias',
+        description='BTC Intraday Scanner — 5m/15m/30m with Order Book and CVD metrics',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('-tf', '--timeframe', type=str, default=None,
-        help='Single timeframe: 5m, 15m or 30m. Omit to scan all.')
-    parser.add_argument('--both', action='store_true',
-        help='Explicitly scan all default timeframes (when -tf not set)')
+    parser.add_argument('-tf', '--timeframe', type=str, default='5m',
+        help='Timeframe to scan: 5m, 15m, or 30m. Default is 5m.')
     parser.add_argument('--loop', type=int, default=0,
         help='Repeat scan every N minutes (0 = single run)')
     parser.add_argument('--account', type=float, default=10000,
@@ -42,15 +38,15 @@ def parse_args():
     parser.add_argument('--risk', type=float, default=0.01,
         help='Risk per trade as decimal (default: 0.01 = 1%%)')
     parser.add_argument('--no-bias', action='store_true',
-        help='Disable trend-bias weighting (treat BUY and SELL equally)')
+        help='Disable macro trend-bias weighting')
     parser.add_argument('-v', '--verbose', action='store_true',
-        help='Show all filter details per signal')
+        help='Show all advanced filter details per signal')
     parser.add_argument('--min-conf', type=float, default=50.0,
         help='Minimum confidence to display a signal (default: 50)')
     return parser.parse_args()
 
 # ============================================
-# EXCHANGE (CACHED)
+# EXCHANGE INTERFACE (CACHED)
 # ============================================
 
 _EX = {}
@@ -70,8 +66,64 @@ def fetch_ohlcv(symbol, timeframe, limit=350):
         print(f"  ⚠️ fetch_ohlcv({symbol},{timeframe}): {str(e)[:60]}")
         return None
 
+def fetch_order_book_imbalance(symbol, depth_pct=0.005):
+    """
+    Measures limit order book imbalance within depth_pct (default 0.5%) of mid price.
+    Returns: ratio (bids_volume / asks_volume)
+    """
+    try:
+        ex = get_exchange()
+        ob = ex.fetch_order_book(symbol, limit=50)
+        if not ob['bids'] or not ob['asks']:
+            return 1.0
+        
+        mid = (ob['bids'][0][0] + ob['asks'][0][0]) / 2.0
+        lower_bound = mid * (1 - depth_pct)
+        upper_bound = mid * (1 + depth_pct)
+        
+        bids_vol = sum([b[1] for b in ob['bids'] if b[0] >= lower_bound])
+        asks_vol = sum([a[1] for a in ob['asks'] if a[0] <= upper_bound])
+        
+        if asks_vol == 0:
+            return 2.0
+        return bids_vol / asks_vol
+    except Exception:
+        return 1.0
+
+def fetch_approx_cvd(symbol, lookback_minutes=5):
+    """
+    Approximates Cumulative Volume Delta (Market Buys - Market Sells) from recent trade data.
+    Returns: cvd_ratio (net_buys / total_volume) -> >0 is bullish buying pressure, <0 is selling pressure.
+    """
+    try:
+        ex = get_exchange()
+        trades = ex.fetch_trades(symbol, limit=200)
+        if not trades:
+            return 0.0
+        
+        now_ms = ex.milliseconds()
+        cutoff_ms = now_ms - (lookback_minutes * 60 * 1000)
+        
+        net_delta = 0.0
+        total_vol = 0.0
+        
+        for t in trades:
+            if t['timestamp'] >= cutoff_ms:
+                vol = t['amount']
+                total_vol += vol
+                if t['side'] == 'buy':
+                    net_delta += vol
+                else:
+                    net_delta -= vol
+                    
+        if total_vol == 0:
+            return 0.0
+        return net_delta / total_vol
+    except Exception:
+        return 0.0
+
 # ============================================
-# INDICATORS
+# TECHNICAL INDICATORS
 # ============================================
 
 def gaussian_kernel(x, h):
@@ -255,21 +307,21 @@ def get_btc_trend_bias():
     return bias, round(total_score, 1), results
 
 # ============================================
-# TIMEFRAME PARAMS (5m ADDED & TUNED)
+# TIMEFRAME CONFIGURATION
 # ============================================
 
 TF_PARAMS = {
     '5m': {
-        'lookback': 120,       # Shorter window for hyper-localized 5m momentum
-        'bandwidth': 2.5,      # Tighter bandwidth to fit compressed intraday distribution
-        'multiplier': 1.6,     # Narrower multiplier targets fast edge touch/reversals
-        'rsi_period': 7,       # Highly responsive RSI to catch momentum micro-turns
-        'ma_period': 30,       # Faster trend-alignment boundary
+        'lookback': 120,       # Fast localized data processing
+        'bandwidth': 2.5,      # Tight envelope for 5m high frequency noise
+        'multiplier': 1.6,     # Narrow bands optimized to catch wick touches
+        'rsi_period': 7,       # Highly reactive RSI
+        'ma_period': 30,       # Near-term dynamic average line
         'confirm_tf': '1h',
-        'stop_pct': 0.004,     # Tight 0.4% baseline stop-loss for 5m scalps
-        'tp1_pct': 0.005,      # 0.5% Target 1
-        'tp2_pct': 0.010,      # 1.0% Target 2
-        'tp3_pct': 0.018,      # 1.8% Target 3
+        'stop_pct': 0.004,     # Precision 0.4% baseline stop loss
+        'tp1_pct': 0.004,      # 1:1 R:R target 1 scale out
+        'tp2_pct': 0.008,
+        'tp3_pct': 0.015,
     },
     '15m': {
         'lookback': 150,
@@ -298,7 +350,7 @@ TF_PARAMS = {
 }
 
 # ============================================
-# SIGNAL DETECTION
+# SIGNAL ENGINE
 # ============================================
 
 def detect_btc_signals(df, tf, bias, use_bias=True):
@@ -321,6 +373,11 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
     h_exp = hurst_exponent(close)
     struct = detect_market_structure(high, low)
     ob_zone, fvg_zone = find_ob_and_fvg(high, low, close)
+
+    # --- ADVANCED METRIC 1: ATR Volatility Expansion Baseline ---
+    current_atr = atr(high, low, close, 14)
+    avg_atr_long = np.mean([atr(high[:i], low[:i], close[:i], 14) for i in range(len(close)-30, len(close))])
+    is_low_vol_chop = current_atr < (avg_atr_long * 0.75)  # Volatility is compressed below normal levels
 
     current = close[-1]
     prev    = close[-2]
@@ -351,23 +408,32 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
         candidates.append({'dir': 'SELL', 'type': 'SELL_OVERBOUGHT', 'conf': conf,
                            'desc': f'Overbought RSI {rsi_val:.0f} at upper band'})
 
-    # 5. Price extreme beyond band (BUY)
-    if lower > 0 and (current - lower) / current * 100 < -1.5:
-        candidates.append({'dir': 'BUY', 'type': 'BUY_EXTREME', 'conf': 58,
-                           'desc': f'Price {abs((current-lower)/current*100):.1f}% below lower band'})
-
-    # 6. Price extreme beyond band (SELL)
-    if upper > 0 and (upper - current) / current * 100 < -1.5:
-        candidates.append({'dir': 'SELL', 'type': 'SELL_EXTREME', 'conf': 58,
-                           'desc': f'Price {abs((upper-current)/current*100):.1f}% above upper band'})
-
     if not candidates:
         return []
 
+    # Fetch confirmations outside data loop
     rsi_1h = None
     df1h = fetch_ohlcv('BTC/USDT', p['confirm_tf'], limit=60)
     if df1h is not None and len(df1h) >= 20:
         rsi_1h = rsi(df1h['close'].values[-30:], 14)
+
+    # --- ADVANCED METRIC 2: Intermediate Trend Alignment (15m Ribbon) ---
+    trend_15m = 'neutral'
+    if tf == '5m':
+        df15 = fetch_ohlcv('BTC/USDT', '15m', limit=60)
+        if df15 is not None and len(df15) >= 50:
+            c15 = df15['close'].values
+            ema9 = ema(c15, 9)
+            ema21 = ema(c15, 21)
+            ema55 = ema(c15, 55)
+            if ema9 > ema21 > ema55:
+                trend_15m = 'bullish'
+            elif ema9 < ema21 < ema55:
+                trend_15m = 'bearish'
+
+    # --- ADVANCED METRIC 3 & 4: Order Book Imbalance & CVD ---
+    ob_imbalance = fetch_order_book_imbalance('BTC/USDT', depth_pct=0.005)
+    approx_cvd = fetch_approx_cvd('BTC/USDT', lookback_minutes=5)
 
     signals = []
     for sig in candidates:
@@ -375,160 +441,111 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
         notes = []
         skip = False
 
-        # ── TREND BIAS ────────────────────────────────────────────────
+        # Apply Volatility Chop Protection
+        if is_low_vol_chop:
+            c -= 25
+            notes.append("⚠️ Low Volatility Chop detected (ATR compressed) — Penalty Applied")
+
+        # ── INTERMEDIATE TREND (15m Ribbon Protection) ─────────────
+        if tf == '5m' and trend_15m != 'neutral':
+            if sig['dir'] == 'BUY' and trend_15m == 'bearish':
+                c -= 20
+                notes.append("❌ Blown out 15m EMA Ribbon Trend is BEARISH. Fighting trend.")
+            elif sig['dir'] == 'SELL' and trend_15m == 'bullish':
+                c -= 20
+                notes.append("❌ Blown out 15m EMA Ribbon Trend is BULLISH. Fighting trend.")
+            elif (sig['dir'] == 'BUY' and trend_15m == 'bullish') or (sig['dir'] == 'SELL' and trend_15m == 'bearish'):
+                c += 10
+                notes.append(f"✅ Fast 15m EMA Ribbon confirms direction ({trend_15m})")
+
+        # ── ORDER BOOK DEPTH IMBALANCE ──────────────────────────────
+        if sig['dir'] == 'BUY':
+            if ob_imbalance >= 1.4:
+                c += 15
+                notes.append(f"🔥 Order Book Support: Buy wall depth ratio {ob_imbalance:.2f}x")
+            elif ob_imbalance <= 0.6:
+                c -= 20
+                notes.append(f"⚠️ Thin Order Book Support: Ask side heavier ({ob_imbalance:.2f}x)")
+        else:
+            if ob_imbalance <= 0.6:
+                c += 15
+                notes.append(f"🔥 Order Book Resistance: Sell wall depth ratio {1/ob_imbalance:.2f}x heavier")
+            elif ob_imbalance >= 1.4:
+                c -= 20
+                notes.append(f"⚠️ Thin Order Book Resistance: Bid side heavier ({ob_imbalance:.2f}x)")
+
+        # ── CUMULATIVE VOLUME DELTA (CVD) PRESSURE ─────────────────
+        if sig['dir'] == 'BUY':
+            if approx_cvd > 0.15:
+                c += 12
+                notes.append(f"📈 CVD Bullish: Aggressive market buying pressure ({approx_cvd*100:+.1f}%)")
+            elif approx_cvd < -0.25:
+                c -= 15
+                notes.append(f"⚠️ CVD Divergence Warning: Aggressive market dump taking place ({approx_cvd*100:+.1f}%)")
+        else:
+            if approx_cvd < -0.15:
+                c += 12
+                notes.append(f"📉 CVD Bearish: Aggressive market selling pressure ({approx_cvd*100:+.1f}%)")
+            elif approx_cvd > 0.25:
+                c -= 15
+                notes.append(f"⚠️ CVD Divergence Warning: Aggressive absorption/buying taking place ({approx_cvd*100:+.1f}%)")
+
+        # ── MACRO TREND BIAS ──────────────────────────────────────────
         if use_bias:
             if bias in ('BEARISH_STRONG', 'BEARISH'):
                 if sig['dir'] == 'SELL':
-                    boost = 25 if bias == 'BEARISH_STRONG' else 15
+                    boost = 20 if bias == 'BEARISH_STRONG' else 10
                     c += boost
-                    notes.append(f"✅ Bias {bias} confirms SELL +{boost}")
+                    notes.append(f"✅ Macro Bias {bias} confirms SELL")
                 elif sig['dir'] == 'BUY':
                     if rsi_val < 20:
-                        c -= 10
-                        notes.append(f"⚠️ Counter-trend BUY vs {bias} (RSI extreme, partial ok)")
+                        c -= 15
+                        notes.append("⚠️ Counter-trend BUY accepted exclusively due to oversold conditions")
                     else:
                         c -= 30
-                        notes.append(f"❌ Counter-trend BUY vs {bias}")
-                        if c < 50:
-                            skip = True
-
+                        notes.append(f"❌ Rejected counter-trend BUY against macro {bias}")
+                        skip = True
             elif bias in ('BULLISH_STRONG', 'BULLISH'):
                 if sig['dir'] == 'BUY':
-                    boost = 25 if bias == 'BULLISH_STRONG' else 15
+                    boost = 20 if bias == 'BULLISH_STRONG' else 10
                     c += boost
-                    notes.append(f"✅ Bias {bias} confirms BUY +{boost}")
+                    notes.append(f"✅ Macro Bias {bias} confirms BUY")
                 elif sig['dir'] == 'SELL':
                     if rsi_val > 80:
-                        c -= 10
-                        notes.append(f"⚠️ Counter-trend SELL vs {bias} (RSI extreme, partial ok)")
+                        c -= 15
+                        notes.append("⚠️ Counter-trend SELL accepted exclusively due to overbought conditions")
                     else:
                         c -= 30
-                        notes.append(f"❌ Counter-trend SELL vs {bias}")
-                        if c < 50:
-                            skip = True
-            else:
-                notes.append("⚪ Bias NEUTRAL — equal weight")
-        if skip:
+                        notes.append(f"❌ Rejected counter-trend SELL against macro {bias}")
+                        skip = True
+
+        if skip or c < 50:
             continue
 
-        # ── VOLUME ────────────────────────────────────────────────────
+        # Basic volume confirmation logic
         if len(vol) > 15:
             avg_vol = np.mean(vol[-15:])
             vr = vol[-1] / avg_vol if avg_vol > 0 else 1.0
-            p5_chg = (current - close[-5]) / close[-5] * 100 if len(close) >= 5 else 0
-            if vr > 1.8:
-                if (sig['dir'] == 'BUY' and p5_chg < -2) or (sig['dir'] == 'SELL' and p5_chg > 2):
-                    c -= 20
-                    notes.append(f"⚠️ High vol {vr:.1f}x against signal")
-                else:
-                    c += 12
-                    notes.append(f"🔥 Volume {vr:.1f}x avg — momentum")
-            elif vr > 1.3:
+            if vr > 1.5:
                 c += 5
-                notes.append(f"📈 Volume {vr:.1f}x avg")
-            else:
-                notes.append(f"📉 Volume light {vr:.1f}x avg")
+                notes.append(f"📈 Local volume spike ({vr:.1f}x avg)")
 
-        # ── MA ALIGNMENT ──────────────────────────────────────────────
-        if sig['dir'] == 'BUY':
-            if current > ma:
-                c += 8
-                notes.append(f"✅ Above MA{p['ma_period']}")
-            else:
-                c -= 12
-                notes.append(f"⚠️ Below MA{p['ma_period']}")
-        else:
-            if current < ma:
-                c += 8
-                notes.append(f"✅ Below MA{p['ma_period']}")
-            else:
-                c -= 12
-                notes.append(f"⚠️ Above MA{p['ma_period']}")
+        # Market structure / Indicators scoring updates
+        if sig['dir'] == 'BUY' and current > ma:
+            c += 5
+        elif sig['dir'] == 'SELL' and current < ma:
+            c += 5
 
-        # ── 1H RSI CONFIRMATION ───────────────────────────────────────
-        if rsi_1h is not None:
-            if sig['dir'] == 'BUY':
-                if rsi_1h < 35:
-                    c += 15
-                    notes.append(f"✅ 1h RSI {rsi_1h:.0f} oversold — confirms BUY")
-                elif rsi_1h > 65:
-                    c -= 20
-                    notes.append(f"⚠️ 1h RSI {rsi_1h:.0f} overbought — BUY risky")
-                    if rsi_1h > 75:
-                        skip = True
-                else:
-                    notes.append(f"⚪ 1h RSI {rsi_1h:.0f}")
-            else:
-                if rsi_1h > 65:
-                    c += 15
-                    notes.append(f"✅ 1h RSI {rsi_1h:.0f} overbought — confirms SELL")
-                elif rsi_1h < 35:
-                    c -= 20
-                    notes.append(f"⚠️ 1h RSI {rsi_1h:.0f} oversold — SELL risky")
-                    if rsi_1h < 25:
-                        skip = True
-                else:
-                    notes.append(f"⚪ 1h RSI {rsi_1h:.0f}")
-        if skip:
-            continue
-
-        # ── SQUEEZE MOMENTUM ──────────────────────────────────────────
         if sq_release:
             if (sig['dir'] == 'BUY' and sq_bull) or (sig['dir'] == 'SELL' and not sq_bull):
-                c += 18
-                notes.append("🔥 Squeeze RELEASE in signal direction")
-            else:
-                c -= 10
-                notes.append("⚠️ Squeeze release opposite direction")
-        elif squeeze_on:
-            notes.append("📊 Squeeze ON — energy coiling")
-        else:
-            c -= 5
-            notes.append("⚪ No squeeze")
+                c += 10
+                notes.append("🔥 Squeeze Breakout Active")
 
-        # ── HURST / TREND QUALITY ─────────────────────────────────────
         if h_exp > 0.55:
-            c += 8
-            notes.append(f"✅ Hurst {h_exp:.2f} — trending")
-        elif h_exp < 0.45:
-            notes.append(f"⚪ Hurst {h_exp:.2f} — mean-reverting")
-        else:
-            notes.append(f"⚪ Hurst {h_exp:.2f} — random walk")
+            c += 5
 
-        # ── MARKET STRUCTURE ──────────────────────────────────────────
-        if sig['dir'] == 'BUY' and struct == 'bullish':
-            c += 10
-            notes.append("✅ BTC structure: Higher Highs / Higher Lows")
-        elif sig['dir'] == 'SELL' and struct == 'bearish':
-            c += 10
-            notes.append("✅ BTC structure: Lower Highs / Lower Lows")
-        elif (sig['dir'] == 'BUY' and struct == 'bearish') or \
-             (sig['dir'] == 'SELL' and struct == 'bullish'):
-            c -= 10
-            notes.append(f"⚠️ Structure {struct} contradicts signal")
-
-        # ── ORDER BLOCK ───────────────────────────────────────────────
-        ob_low, ob_high, ob_dir = ob_zone
-        if ob_low is not None:
-            in_ob = ob_low <= current <= ob_high * 1.01
-            if in_ob and ob_dir == sig['dir'].lower() + 'ish':
-                c += 10
-                notes.append(f"✅ In {ob_dir} Order Block ${ob_low:.0f}-${ob_high:.0f}")
-            elif in_ob:
-                notes.append(f"⚠️ In {ob_dir} OB (opposite dir)")
-
-        # ── FVG ───────────────────────────────────────────────────────
-        fvg_lo, fvg_hi, fvg_dir = fvg_zone
-        if fvg_lo is not None:
-            in_fvg = fvg_lo <= current <= fvg_hi
-            expected_fvg = 'bullish' if sig['dir'] == 'BUY' else 'bearish'
-            if in_fvg and fvg_dir == expected_fvg:
-                c += 10
-                notes.append(f"✅ In {fvg_dir} FVG ${fvg_lo:.0f}-${fvg_hi:.0f}")
-
-        # ── FINAL ─────────────────────────────────────────────────────
         c = float(np.clip(c, 0, 100))
-        if c < 50:
+        if c < min_conf:
             continue
 
         signals.append({
@@ -544,17 +561,15 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
             'upper':   round(upper, 2),
             'lower':   round(lower, 2),
             'ma':      round(ma, 2),
-            'squeeze_on': squeeze_on,
-            'sq_release': sq_release,
-            'hurst':   round(h_exp, 2),
-            'struct':  struct,
+            'ob_ratio': round(ob_imbalance, 2),
+            'cvd_pct':  round(approx_cvd * 100, 1)
         })
 
     signals.sort(key=lambda x: x['conf'], reverse=True)
     return signals
 
 # ============================================
-# ENTRY / EXIT LEVELS
+# TRADE COMPILER
 # ============================================
 
 def build_trade_plan(sig, tf, account_size, risk_pct):
@@ -563,13 +578,13 @@ def build_trade_plan(sig, tf, account_size, risk_pct):
     direction = sig['dir']
 
     if direction == 'BUY':
-        entry = max(price, sig['lower'] * 1.001)  # Tighter buffer entry for 5m
+        entry = max(price, sig['lower'] * 1.001)
         stop  = min(price * (1 - p['stop_pct']), sig['lower'] * 0.999)
         tp1   = entry * (1 + p['tp1_pct'])
         tp2   = entry * (1 + p['tp2_pct'])
         tp3   = entry * (1 + p['tp3_pct'])
     else:
-        entry = min(price, sig['upper'] * 0.999)  # Tighter buffer entry for 5m
+        entry = min(price, sig['upper'] * 0.999)
         stop  = max(price * (1 + p['stop_pct']), sig['upper'] * 1.001)
         tp1   = entry * (1 - p['tp1_pct'])
         tp2   = entry * (1 - p['tp2_pct'])
@@ -578,14 +593,8 @@ def build_trade_plan(sig, tf, account_size, risk_pct):
     risk_per_unit = abs(entry - stop)
     dollar_risk   = account_size * risk_pct * (0.5 + sig['conf'] / 100 * 0.8)
     pos_units     = dollar_risk / risk_per_unit if risk_per_unit > 0 else 0
-    pos_value     = pos_units * entry
-    pos_value     = min(pos_value, account_size * 0.4)
+    pos_value     = min(pos_units * entry, account_size * 0.4)
     pos_units     = pos_value / entry
-
-    def gain(t):
-        return round(abs(t - entry) / entry * 100, 2)
-    def rr(t):
-        return round(abs(t - entry) / risk_per_unit, 2) if risk_per_unit > 0 else 0
 
     return {
         'entry':  round(entry, 2),
@@ -593,150 +602,81 @@ def build_trade_plan(sig, tf, account_size, risk_pct):
         'tp1':    round(tp1, 2),
         'tp2':    round(tp2, 2),
         'tp3':    round(tp3, 2),
-        'gain1':  gain(tp1),
-        'gain2':  gain(tp2),
-        'gain3':  gain(tp3),
-        'rr1':    rr(tp1),
-        'rr2':    rr(tp2),
-        'rr3':    rr(tp3),
-        'units':  round(pos_units, 6),
+        'gain1':  round(abs(tp1 - entry) / entry * 100, 2),
+        'gain2':  round(abs(tp2 - entry) / entry * 100, 2),
+        'gain3':  round(abs(tp3 - entry) / entry * 100, 2),
+        'units':  round(pos_units, 5),
         'value':  round(pos_value, 2),
         'risk_$': round(dollar_risk, 2),
-        'risk_%': round(dollar_risk / account_size * 100, 2),
     }
 
 # ============================================
-# DISPLAY
+# INTERFACE PRINTS
 # ============================================
-
-BIAS_COLORS = {
-    'BEARISH_STRONG': '🔴🔴',
-    'BEARISH':        '🔴',
-    'NEUTRAL':        '⚪',
-    'BULLISH':        '🟢',
-    'BULLISH_STRONG': '🟢🟢',
-}
-
-def print_bias_header(bias, score, details):
-    icon = BIAS_COLORS.get(bias, '⚪')
-    print(f"\n{'='*70}")
-    print(f"  {icon}  BTC MACRO TREND: {bias}  (score: {score:+.0f})  {icon}")
-    print(f"{'='*70}")
-    for tf, d in details.items():
-        struct_icon = '📈' if d['structure'] == 'bullish' else ('📉' if d['structure'] == 'bearish' else '➡️')
-        print(f"  [{tf}] Price: ${d['price']:,.2f} | RSI: {d['rsi']} | EMA50: ${d['ema50']:,.2f} | "
-              f"Structure: {struct_icon}{d['structure'].upper()} | Score: {d['tf_score']:+.0f}")
-    print(f"{'='*70}\n")
 
 def print_signal(sig, plan, tf, verbose=False):
     emoji = '🟢' if sig['dir'] == 'BUY' else '🔴'
     print(f"\n  {emoji} [{tf}] BTC/USDT — {sig['dir']}  |  Conf: {sig['conf']}%  |  {sig['desc']}")
-    print(f"     Price: ${sig['price']:,.2f}  |  RSI({tf}): {sig['rsi']}  |  RSI(1h): {sig['rsi_1h']}"
-          f"  |  MA: ${sig['ma']:,.2f}")
-    print(f"     NW Band: Lower ${sig['lower']:,.2f}  |  Mid ${sig['mid']:,.2f}  |  Upper ${sig['upper']:,.2f}")
-    if sig['sq_release']:
-        print(f"     🔥 SQUEEZE RELEASE  |  Hurst: {sig['hurst']}  |  Structure: {sig['struct'].upper()}")
-    else:
-        sq_str = 'ON (coiling)' if sig['squeeze_on'] else 'off'
-        print(f"     Squeeze: {sq_str}  |  Hurst: {sig['hurst']}  |  Structure: {sig['struct'].upper()}")
-    print()
+    print(f"     Price: ${sig['price']:,.2f} | RSI({tf}): {sig['rsi']} | Book Balance: {sig['ob_ratio']}x | CVD Delta: {sig['cvd_pct']:+}%")
     print(f"     📍 Entry   : ${plan['entry']:,.2f}")
-    print(f"     🛑 Stop    : ${plan['stop']:,.2f}  (risk ${plan['risk_$']:.2f} = {plan['risk_%']:.1f}% of account)")
-    print(f"     🎯 TP1     : ${plan['tp1']:,.2f}  (+{plan['gain1']}%)  R:R {plan['rr1']:.1f}")
-    print(f"     🎯 TP2     : ${plan['tp2']:,.2f}  (+{plan['gain2']}%)  R:R {plan['rr2']:.1f}")
-    print(f"     🎯 TP3     : ${plan['tp3']:,.2f}  (+{plan['gain3']}%)  R:R {plan['rr3']:.1f}")
-    print(f"     📊 Size    : {plan['units']:.6f} BTC  (${plan['value']:,.2f})")
+    print(f"     🛑 Stop    : ${plan['stop']:,.2f}  (Risk: ${plan['risk_$']:.2f})")
+    print(f"     🎯 Target 1: ${plan['tp1']:,.2f}  (+{plan['gain1']}%)")
+    print(f"     🎯 Target 2: ${plan['tp2']:,.2f}  (+{plan['gain2']}%)")
+    print(f"     🎯 Target 3: ${plan['tp3']:,.2f}  (+{plan['gain3']}%)")
+    print(f"     📊 Allocation: {plan['units']} BTC (${plan['value']:,.2f})")
     if verbose:
-        print(f"\n     Filter log:")
+        print("     Order Validation Logs:")
         for n in sig['notes']:
             print(f"       {n}")
 
-def print_no_signals(tf, bias):
-    trend_msg = {
-        'BEARISH_STRONG': "Market is STRONGLY BEARISH — waiting for confirmed SELL setups.",
-        'BEARISH':        "Market is BEARISH — prioritizing SELL signals.",
-        'NEUTRAL':        "Market is NEUTRAL — waiting for directional conviction.",
-        'BULLISH':        "Market is BULLISH — prioritizing BUY signals.",
-        'BULLISH_STRONG': "Market is STRONGLY BULLISH — waiting for confirmed BUY setups.",
-    }.get(bias, "No directional bias detected.")
-    print(f"\n  ⏳ [{tf}] No qualifying BTC signals above threshold.")
-    print(f"     {trend_msg}")
-
 # ============================================
-# MAIN SCAN
+# MAIN SCAN LOOP
 # ============================================
 
 def run_scan(timeframes, account_size, risk_pct, use_bias, verbose, min_conf):
     print(f"\n{'='*70}")
-    print(f"  📡 BTC INTRADAY SCANNER — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"  Account: ${account_size:,}  |  Risk: {risk_pct*100:.1f}%/trade  |  Bias: {'ON' if use_bias else 'OFF'}")
-    print(f"  Timeframes: {' + '.join(timeframes)}")
+    print(f"  📡 BTC LIQUIDITY ENGINE — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*70}")
 
-    print("\n  🔍 Fetching BTC macro trend (1h + 4h)...")
     bias, score, bias_details = get_btc_trend_bias()
-    print_bias_header(bias, score, bias_details)
-
-    all_signals = []
+    
+    icon = '🟢' if 'BULLISH' in bias else ('🔴' if 'BEARISH' in bias else '⚪')
+    print(f"  {icon}  BTC MACRO MATRIX BIAS: {bias} (Score: {score:+.0f})")
+    print(f"{'='*70}")
 
     for tf in timeframes:
-        print(f"\n  ⏱️  Scanning BTC/USDT [{tf}]...")
-        df = fetch_ohlcv('BTC/USDT', tf, limit=TF_PARAMS[tf]['lookback'] + 50)
-        if df is None or len(df) < TF_PARAMS[tf]['lookback']:
-            print(f"  ❌ [{tf}] Insufficient data")
+        print(f"  ⏱️  Processing Candlestick & Order Stream Matrix [{tf}]...")
+        df = fetch_ohlcv('BTC/USDT', tf, limit=TF_PARAMS[tf]['lookback'] + 30)
+        if df is None:
             continue
 
         signals = detect_btc_signals(df, tf, bias, use_bias=use_bias)
         signals = [s for s in signals if s['conf'] >= min_conf]
 
         if not signals:
-            print_no_signals(tf, bias)
+            print(f"  ⏳ [{tf}] No qualifying order-flow confirmation signals.")
         else:
             for sig in signals:
                 plan = build_trade_plan(sig, tf, account_size, risk_pct)
                 print_signal(sig, plan, tf, verbose=verbose)
-                all_signals.append({'tf': tf, 'sig': sig, 'plan': plan})
-
-    print(f"\n{'='*70}")
-    buys  = [x for x in all_signals if x['sig']['dir'] == 'BUY']
-    sells = [x for x in all_signals if x['sig']['dir'] == 'SELL']
-    print(f"  SUMMARY: {len(buys)} BUY  |  {len(sells)} SELL  |  Bias: {bias} ({score:+.0f})")
-
-    if bias in ('BEARISH', 'BEARISH_STRONG') and buys and not sells:
-        print(f"  ⚠️  BUY signals exist but macro trend is {bias}. Size down or skip.")
-    if bias in ('BULLISH', 'BULLISH_STRONG') and sells and not buys:
-        print(f"  ⚠️  SELL signals exist but macro trend is {bias}. Size down or skip.")
-
     print(f"{'='*70}\n")
-    return all_signals
-
-# ============================================
-# ENTRY POINT
-# ============================================
 
 def main():
     args = parse_args()
+    if args.timeframe not in ('5m', '15m', '30m'):
+        print("❌ Error: Supported timeframes are 5m, 15m, 30m.")
+        sys.exit(1)
 
-    if args.timeframe:
-        if args.timeframe not in ('5m', '15m', '30m'):
-            print(f"❌ This scanner supports 5m, 15m, and 30m only. Got: {args.timeframe}")
-            sys.exit(1)
-        timeframes = [args.timeframe]
-    else:
-        timeframes = ['5m', '15m', '30m']   # Defaults to checking all three now
-
+    timeframes = [args.timeframe]
     use_bias = not args.no_bias
 
     if args.loop > 0:
-        print(f"🔁 Loop mode: scanning every {args.loop} minutes. Ctrl+C to stop.")
+        print(f"🔁 Scanner live in memory. Sampling matrix every {args.loop}m.")
         while True:
             try:
                 run_scan(timeframes, args.account, args.risk, use_bias, args.verbose, args.min_conf)
-                next_run = datetime.utcnow().strftime('%H:%M UTC')
-                print(f"  ⏰ Next scan at +{args.loop}m from {next_run}. Sleeping...\n")
                 time.sleep(args.loop * 60)
             except KeyboardInterrupt:
-                print("\n👋 Scanner stopped.")
                 break
     else:
         run_scan(timeframes, args.account, args.risk, use_bias, args.verbose, args.min_conf)
