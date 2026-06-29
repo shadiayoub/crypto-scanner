@@ -451,8 +451,8 @@ def print_signal(sig, plan, tf, verbose=False):
 
 def get_feed_path():
     # Resolve repo-root/data/alerts.json from this file's location,
-    # so it works regardless of the process cwd (this script lives in gemeni/).
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # so it works regardless of the process cwd (this script lives at the repo root).
+    repo_root = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(repo_root, 'data', 'alerts.json')
 
 def build_feed_entry(sig, plan, tf):
