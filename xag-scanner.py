@@ -8,6 +8,7 @@ session-aware filtering, and liquidity sweep detection.
 import ccxt
 import pandas as pd
 import numpy as np
+import ctrader_feed  # silver OHLC sourced from cTrader (XAGUSD), more accurate than Binance perp
 from datetime import datetime, timezone
 import time
 import warnings
@@ -57,35 +58,26 @@ def get_exchange():
         })
     return _EX['futures']
 
+# Silver now comes from cTrader (XAGUSD) for price accuracy, since we trade there.
+CTRADER_SILVER = 'XAGUSD'
+
 def fetch_ohlcv(symbol, timeframe, limit=350):
     try:
-        ex = get_exchange()
-        raw = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
-        df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
-        return df
+        # Route silver to cTrader; same OHLCV columns the rest of the file expects.
+        df = ctrader_feed.get_trendbars(CTRADER_SILVER, timeframe, count=limit)
+        if df is None:
+            return None
+        return df.rename(columns={'timestamp': 'ts'})
     except Exception as e:
         print(f"  ⚠️ fetch_ohlcv({symbol},{timeframe}): {str(e)[:60]}")
         return None
 
 def fetch_order_book_imbalance(symbol, depth_pct=0.003):
-    try:
-        ex = get_exchange()
-        ob = ex.fetch_order_book(symbol, limit=50)
-        if not ob['bids'] or not ob['asks']:
-            return 1.0
-        
-        mid = (ob['bids'][0][0] + ob['asks'][0][0]) / 2.0
-        lower_bound = mid * (1 - depth_pct)
-        upper_bound = mid * (1 + depth_pct)
-        
-        bids_vol = sum([b[1] for b in ob['bids'] if b[0] >= lower_bound])
-        asks_vol = sum([a[1] for a in ob['asks'] if a[0] <= upper_bound])
-        
-        if asks_vol == 0:
-            return 2.0
-        return bids_vol / asks_vol
-    except Exception:
-        return 1.0
+    # cTrader L2 depth isn't wired (it's a live subscription, not a trendbar
+    # fetch), and mixing Binance's book with cTrader prices would cross venues.
+    # Return neutral (1.0) — downstream treats 1.0 as no adjustment, so the
+    # order-flow filter degrades cleanly until depth streaming is added.
+    return 1.0
 
 # ============================================
 # MATHEMATICAL INDICATORS

@@ -20,6 +20,7 @@ SMC Note:
 import ccxt
 import pandas as pd
 import numpy as np
+import ctrader_feed  # cTrader OHLC source for metals/forex/indices (lazy-connects)
 from datetime import datetime
 import time
 import warnings
@@ -130,14 +131,17 @@ SPOT_SYMBOLS = [
     'ZEC/USDT'
 ]
 
-# Futures symbols (for metals and other perpetuals)
-FUTURES_SYMBOLS = [
-    'XAU/USDT:USDT',  # Gold perpetual
-    'XAG/USDT:USDT'   # Silver perpetual
+# Instruments sourced from cTrader instead of Binance — more accurate prices
+# since we trade on cTrader. Crypto stays on Binance via ccxt; metals (and later
+# forex/indices) come from cTrader as spot CFDs (XAUUSD/XAGUSD, not USDT perps).
+CTRADER_SYMBOLS = [
+    'XAUUSD',  # Gold spot (cTrader)
+    'XAGUSD',  # Silver spot (cTrader)
 ]
+CTRADER_SYMBOL_SET = set(CTRADER_SYMBOLS)
 
 # Combine all symbols
-SYMBOLS = SPOT_SYMBOLS + FUTURES_SYMBOLS
+SYMBOLS = SPOT_SYMBOLS + CTRADER_SYMBOLS
 
 # ============================================
 # TIMEFRAME-SPECIFIC PARAMETERS
@@ -531,6 +535,12 @@ def get_exchange(is_futures):
 
 def fetch_data(symbol, timeframe, limit=550):
     try:
+        # Route by asset class: cTrader instruments (metals/forex/indices) use the
+        # cTrader feed; everything else (crypto) uses Binance via ccxt. Same
+        # DataFrame shape either way, so downstream indicator code is untouched.
+        if symbol in CTRADER_SYMBOL_SET:
+            return ctrader_feed.get_trendbars(symbol, timeframe, count=limit)
+
         is_futures = ':' in symbol
         exchange = get_exchange(is_futures)
 
@@ -1192,7 +1202,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"Account: ${account_size:,} | Risk: {risk_percent*100:.1f}% per trade | Max Positions: {max_positions}")
     print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
     print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
-    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures")
+    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot (Binance) + {len(CTRADER_SYMBOLS)} cTrader")
     print(f"BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
     print(f"Filters: Squeeze={'✅' if use_squeeze else '❌'} | SMRE={'✅' if use_smre else '❌'} | SMC={'✅' if use_smc else '❌'}")
     print(f"{'='*110}\n")

@@ -26,10 +26,10 @@ pip install ccxt pandas numpy
 
 ### 3. File Deployment
 
-Save the provided script file as `btc_scanner.py` and ensure it is executable (on Linux/macOS):
+Save the provided script file as `btc-scanner.py` and ensure it is executable (on Linux/macOS):
 
 ```bash
-chmod +x btc_scanner.py
+chmod +x btc-scanner.py
 
 ```
 
@@ -42,7 +42,7 @@ You can customize the environment criteria directly via CLI arguments.
 ### Running a Standard 5-Minute Scan (Single Run)
 
 ```bash
-python btc_scanner.py -tf 5m
+python btc-scanner.py -tf 5m
 
 ```
 
@@ -51,7 +51,7 @@ python btc_scanner.py -tf 5m
 To visually inspect the exact points added or subtracted by order book walls, CVD metrics, or MTF alignment filters:
 
 ```bash
-python btc_scanner.py -tf 5m --verbose
+python btc-scanner.py -tf 5m --verbose
 
 ```
 
@@ -60,16 +60,26 @@ python btc_scanner.py -tf 5m --verbose
 Simulates precise positioning sizes based on dynamic risk targets:
 
 ```bash
-python btc_scanner.py -tf 5m --account 25000 --risk 0.015
+python btc-scanner.py -tf 5m --account 25000 --risk 0.015
 
 ```
 
 *Sets account parameter to $25,000 USD risking 1.5% per trade scenario.*
 
+### Filtering by Minimum Confidence (`--min-conf`)
+
+Suppresses any signal scoring below the supplied confidence threshold, so only high-conviction setups are printed:
+
+```bash
+python btc-scanner.py -tf 5m --min-conf 70
+```
+
+*Only displays signals with a confidence score of 70% or higher (default: 50).*
+
 ### Overriding Macro Bias (Pure Range Trading)
 
 ```bash
-python btc_scanner.py -tf 5m --no-bias
+python btc-scanner.py -tf 5m --no-bias
 
 ```
 
@@ -102,7 +112,7 @@ crontab -e
 Add the following line:
 
 ```text
-*/5 * * * * /usr/bin/python3 /path/to/btc_scanner.py -tf 5m >> /path/to/scanner.log 2>&1
+*/5 * * * * /usr/bin/python3 /path/to/btc-scanner.py -tf 5m >> /path/to/scanner.log 2>&1
 
 ```
 
@@ -111,7 +121,7 @@ Add the following line:
 To run inside a persistent terminal or Docker container background environment:
 
 ```bash
-python btc_scanner.py -tf 5m --loop 5
+python btc-scanner.py -tf 5m --loop 5
 
 ```
 
