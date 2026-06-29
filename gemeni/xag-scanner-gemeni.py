@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""
+XAG (Silver) Precision 15m Intraday Scanner
+Optimized for Commodity volatility profiles using adaptive Nadaraya-Watson envelopes,
+Order Book support/resistance depth metrics, and high-precision trade compilers.
+
+Usage:
+    python xag_scanner.py -tf 15m
+    python xag_scanner.py -tf 15m --verbose
+"""
+
+import ccxt
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import time
+import warnings
+import argparse
+import sys
+
+warnings.filterwarnings('ignore')
+
+# ============================================
+# ARGS
+# ============================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='XAG Precision Intraday Scanner — Optimized for 15m Commodity Trading',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('-tf', '--timeframe', type=str, default='15m',
+        help='Timeframe to scan: 5m, 15m, or 30m. Default is 15m.')
+    parser.add_argument('--loop', type=int, default=0,
+        help='Repeat scan every N minutes (0 = single run)')
+    parser.add_argument('--account', type=float, default=10000,
+        help='Account size in USD (default: 10000)')
+    parser.add_argument('--risk', type=float, default=0.01,
+        help='Risk per trade as decimal (default: 0.01 = 1%%)')
+    parser.add_argument('--no-bias', action='store_true',
+        help='Disable macro trend-bias weighting')
+    parser.add_argument('-v', '--verbose', action='store_true',
+        help='Show all order flow and mathematical filter details per signal')
+    parser.add_argument('--min-conf', type=float, default=50.0,
+        help='Minimum confidence to display a signal (default: 50)')
+    return parser.parse_args()
+
+# ============================================
+# EXCHANGE INTERFACE (FUTURES OPTIMIZED)
+# ============================================
+
+_EX = {}
+
+def get_exchange():
+    if 'futures' not in _EX:
+        # Initializing Binance futures module to trade XAG/USDT derivative contracts
+        _EX['futures'] = ccxt.binance({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'}
+        })
+    return _EX['futures']
+
+def fetch_ohlcv(symbol, timeframe, limit=350):
+    try:
+        ex = get_exchange()
+        raw = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
+        return df
+    except Exception as e:
+        print(f"  ⚠️ fetch_ohlcv({symbol},{timeframe}): {str(e)[:60]}")
+        return None
+
+def fetch_order_book_imbalance(symbol, depth_pct=0.003):
+    """
+    Measures commodity limit order book imbalance within a tight 0.3% zone of mid price.
+    Returns: ratio (bids_volume / asks_volume)
+    """
+    try:
+        ex = get_exchange()
+        ob = ex.fetch_order_book(symbol, limit=50)
+        if not ob['bids'] or not ob['asks']:
+            return 1.0
+        
+        mid = (ob['bids'][0][0] + ob['asks'][0][0]) / 2.0
+        lower_bound = mid * (1 - depth_pct)
+        upper_bound = mid * (1 + depth_pct)
+        
+        bids_vol = sum([b[1] for b in ob['bids'] if b[0] >= lower_bound])
+        asks_vol = sum([a[1] for a in ob['asks'] if a[0] <= upper_bound])
+        
+        if asks_vol == 0:
+            return 2.0
+        return bids_vol / asks_vol
+    except Exception:
+        return 1.0
+
+# ============================================
+# MATHEMATICAL INDICATORS
+# ============================================
+
+def gaussian_kernel(x, h):
+    return np.exp(-(x**2) / (2 * h**2))
+
+def nadaraya_watson_envelope(price, h, mult, lookback):
+    n = len(price)
+    if n < lookback:
+        return None, None, None
+    arr = np.array(price[-lookback:])
+    smoothed = np.zeros(lookback)
+    for i in range(lookback):
+        w = gaussian_kernel(np.arange(lookback) - i, h)
+        smoothed[i] = np.sum(arr * w) / np.sum(w)
+    mae = np.mean(np.abs(arr - smoothed)) * mult
+    mid = smoothed[-1]
+    return mid, mid + mae, mid - mae
+
+def rsi(price, period=14):
+    if len(price) < period + 1:
+        return 50.0
+    delta = np.diff(price)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    avg_gain = np.mean(gain[:period])
+    avg_loss = np.mean(loss[:period])
+    for i in range(period, len(delta)):
+        avg_gain = (avg_gain * (period - 1) + gain[i]) / period
+        avg_loss = (avg_loss * (period - 1) + loss[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100 - (100 / (1 + avg_gain / avg_loss))
+
+def ema(price, period):
+    if len(price) < period:
+        return price[-1]
+    k = 2.0 / (period + 1)
+    e = price[0]
+    for p in price[1:]:
+        e = p * k + e * (1 - k)
+    return e
+
+def atr(high, low, close, period=14):
+    if len(high) < period + 1:
+        return (high[-1] - low[-1])
+    tr = np.maximum(high[1:] - low[1:],
+         np.maximum(np.abs(high[1:] - close[:-1]),
+                    np.abs(low[1:] - close[:-1])))
+    return np.mean(tr[-period:])
+
+def detect_market_structure(high, low, swing=8):
+    if len(high) < swing * 3:
+        return 'neutral'
+    sh, sl = [], []
+    for i in range(swing, len(high) - swing):
+        if high[i] == max(high[i-swing:i+swing]):
+            sh.append(high[i])
+        if low[i] == min(low[i-swing:i+swing]):
+            sl.append(low[i])
+    if len(sh) >= 2 and len(sl) >= 2:
+        if sh[-1] > sh[-2] and sl[-1] > sl[-2]:
+            return 'bullish'
+        if sh[-1] < sh[-2] and sl[-1] < sl[-2]:
+            return 'bearish'
+    return 'neutral'
+
+# ============================================
+# COMMODITY MACRO BIAS SCORING (2h + 4h)
+# ============================================
+
+def get_xag_trend_bias():
+    total_score = 0.0
+    results = {}
+
+    for tf, weight in [('2h', 0.4), ('4h', 0.6)]:
+        df = fetch_ohlcv('XAG/USDT', tf, limit=60)
+        if df is None or len(df) < 30:
+            continue
+        c = df['close'].values
+        h = df['high'].values
+        lo = df['low'].values
+
+        rsi_val = rsi(c[-30:], 14)
+        rsi_score = (rsi_val - 50) * 2
+
+        ema50 = ema(c, 50)
+        ema_score = ((c[-1] - ema50) / ema50) * 1500
+        ema_score = float(np.clip(ema_score, -100, 100))
+
+        struct = detect_market_structure(h, lo)
+        struct_score = 30 if struct == 'bullish' else (-30 if struct == 'bearish' else 0)
+
+        tf_score = (rsi_score * 0.35 + ema_score * 0.35 + struct_score * 0.30)
+        total_score += tf_score * weight
+
+        results[tf] = {
+            'rsi': round(rsi_val, 1),
+            'price': round(c[-1], 3),
+            'structure': struct,
+            'tf_score': round(tf_score, 1)
+        }
+
+    total_score = float(np.clip(total_score, -100, 100))
+    if total_score <= -45: bias = 'BEARISH_STRONG'
+    elif total_score <= -15: bias = 'BEARISH'
+    elif total_score >= 45: bias = 'BULLISH_STRONG'
+    elif total_score >= 15: bias = 'BULLISH'
+    else: bias = 'NEUTRAL'
+
+    return bias, round(total_score, 1), results
+
+# ============================================
+# COMMODITY PARAMETERS (TAILORED FOR SILVER)
+# ============================================
+
+TF_PARAMS = {
+    '5m': {
+        'lookback': 140,
+        'bandwidth': 3.0,
+        'multiplier': 1.8,
+        'rsi_period': 8,
+        'ma_period': 40,
+        'stop_pct': 0.005,     # 0.5% stop parameters
+        'tp1_pct': 0.006,
+        'tp2_pct': 0.012,
+        'tp3_pct': 0.022,
+    },
+    '15m': {
+        'lookback': 180,       # Wider mathematical window for 15m commodity ranges
+        'bandwidth': 3.5,      # Tuned for mean-reverting commodity structure
+        'multiplier': 2.1,     # Tailored multiplier tracking to avoid precious metals wick traps
+        'rsi_period': 10,      # Smooth baseline RSI filtering
+        'ma_period': 50,
+        'stop_pct': 0.008,     # 0.8% calibrated commodity baseline protection
+        'tp1_pct': 0.010,      # 1.0% Target 1
+        'tp2_pct': 0.020,      # 2.0% Target 2
+        'tp3_pct': 0.035,      # 3.5% Target 3
+    },
+    '30m': {
+        'lookback': 220,
+        'bandwidth': 4.5,
+        'multiplier': 2.4,
+        'rsi_period': 14,
+        'ma_period': 100,
+        'stop_pct': 0.012,
+        'tp1_pct': 0.015,
+        'tp2_pct': 0.030,
+        'tp3_pct': 0.050,
+    }
+}
+
+# ============================================
+# ADVANCED SCANNING AND FILTER CORE
+# ============================================
+
+def detect_xag_signals(df, tf, bias, use_bias=True):
+    p = TF_PARAMS[tf]
+    close = df['close'].values
+    high  = df['high'].values
+    low   = df['low'].values
+    vol   = df['volume'].values
+
+    if len(close) < p['lookback']:
+        return []
+
+    mid, upper, lower = nadaraya_watson_envelope(close, p['bandwidth'], p['multiplier'], p['lookback'])
+    if mid is None:
+        return []
+
+    rsi_val = rsi(close[-p['rsi_period']-30:], p['rsi_period'])
+    ma = np.mean(close[-p['ma_period']:])
+    struct = detect_market_structure(high, low)
+
+    # --- Volatility Compression Filter ---
+    current_atr = atr(high, low, close, 14)
+    historical_atr_mean = np.mean([atr(high[:i], low[:i], close[:i], 14) for i in range(len(close)-25, len(close))])
+    is_dead_market = current_atr < (historical_atr_mean * 0.70)
+
+    current = close[-1]
+    prev    = close[-2]
+    candidates = []
+
+    # Envelope logic checks
+    if current > lower and prev <= lower and rsi_val < 48:
+        conf = min(80, (48 - rsi_val) * 1.8 + 50)
+        candidates.append({'dir': 'BUY', 'type': 'XAG_BANDS_BUY', 'conf': conf, 'desc': f'Silver recovery inside lower band boundary (RSI {rsi_val:.0f})'})
+
+    if current < upper and prev >= upper and rsi_val > 52:
+        conf = min(80, (rsi_val - 52) * 1.8 + 50)
+        candidates.append({'dir': 'SELL', 'type': 'XAG_BANDS_SELL', 'conf': conf, 'desc': f'Silver rejection away from upper band boundary (RSI {rsi_val:.0f})'})
+
+    if not candidates:
+        return []
+
+    # Get Order book configurations
+    ob_imbalance = fetch_order_book_imbalance('XAG/USDT', depth_pct=0.003)
+
+    signals = []
+    for sig in candidates:
+        c = sig['conf']
+        notes = []
+        skip = False
+
+        if is_dead_market:
+            c -= 20
+            notes.append("⚠️ Commodities Volatility Compressed (ATR Filter activated) — Penalty applied to avoid fake breakout")
+
+        # Live Limit Wall Verification
+        if sig['dir'] == 'BUY':
+            if ob_imbalance >= 1.35:
+                c += 15
+                notes.append(f"🔥 Live Passive Bid Wall verification confirmed: {ob_imbalance:.2f}x buy size advantage")
+            elif ob_imbalance <= 0.65:
+                c -= 20
+                notes.append(f"⚠️ Sell Walls heavy overhead against buy trigger: depth balance ratio ({ob_imbalance:.2f}x)")
+        else:
+            if ob_imbalance <= 0.65:
+                c += 15
+                notes.append(f"🔥 Live Passive Ask Wall verification confirmed: {1/ob_imbalance:.2f}x sell size advantage")
+            elif ob_imbalance >= 1.35:
+                c -= 20
+                notes.append(f"⚠️ Bid liquidity building heavily beneath short trigger: depth balance ratio ({ob_imbalance:.2f}x)")
+
+        # Macro Trend Overlays
+        if use_bias:
+            if bias in ('BEARISH_STRONG', 'BEARISH'):
+                if sig['dir'] == 'SELL':
+                    c += 15
+                    notes.append(f"✅ Direction aligns with structural Macro Bias: {bias}")
+                else:
+                    c -= 25
+                    notes.append(f"❌ Counter-trend BUY suppressed by heavy Macro Bias: {bias}")
+                    if bias == 'BEARISH_STRONG': skip = True
+            elif bias in ('BULLISH_STRONG', 'BULLISH'):
+                if sig['dir'] == 'BUY':
+                    c += 15
+                    notes.append(f"✅ Direction aligns with structural Macro Bias: {bias}")
+                else:
+                    c -= 25
+                    notes.append(f"❌ Counter-trend SELL suppressed by heavy Macro Bias: {bias}")
+                    if bias == 'BULLISH_STRONG': skip = True
+
+        if len(vol) > 10:
+            avg_vol = np.mean(vol[-10:])
+            if vol[-1] > avg_vol * 1.4:
+                c += 8
+                notes.append(f"📈 Momentum Volume confirmed ({vol[-1]/avg_vol:.1f}x normal flow)")
+
+        if skip or c < 50:
+            continue
+
+        signals.append({
+            'dir': sig['dir'],
+            'type': sig['type'],
+            'desc': sig['desc'],
+            'conf': round(np.clip(c, 0, 100), 1),
+            'notes': notes,
+            'price': current,
+            'rsi': round(rsi_val, 1),
+            'mid': round(mid, 3),
+            'upper': round(upper, 3),
+            'lower': round(lower, 3),
+            'ob_ratio': round(ob_imbalance, 2)
+        })
+
+    return signals
+
+# ============================================
+# COMPILER AND EXECUTION PRINTS
+# ============================================
+
+def build_trade_plan(sig, tf, account_size, risk_pct):
+    p = TF_PARAMS[tf]
+    price = sig['price']
+    direction = sig['dir']
+
+    if direction == 'BUY':
+        entry = price
+        stop  = price * (1 - p['stop_pct'])
+        tp1   = entry * (1 + p['tp1_pct'])
+        tp2   = entry * (1 + p['tp2_pct'])
+        tp3   = entry * (1 + p['tp3_pct'])
+    else:
+        entry = price
+        stop  = price * (1 + p['stop_pct'])
+        tp1   = entry * (1 - p['tp1_pct'])
+        tp2   = entry * (1 - p['tp2_pct'])
+        tp3   = entry * (1 - p['tp3_pct'])
+
+    risk_per_unit = abs(entry - stop)
+    dollar_risk   = account_size * risk_pct
+    pos_units     = dollar_risk / risk_per_unit if risk_per_unit > 0 else 0
+    pos_value     = pos_units * entry
+
+    return {
+        'entry': round(entry, 3),
+        'stop':  round(stop, 3),
+        'tp1':   round(tp1, 3),
+        'tp2':   round(tp2, 3),
+        'tp3':   round(tp3, 3),
+        'units': round(pos_units, 2),
+        'value': round(pos_value, 2),
+        'risk_$': round(dollar_risk, 2)
+    }
+
+def print_signal(sig, plan, tf, verbose=False):
+    emoji = '🟢' if sig['dir'] == 'BUY' else '🔴'
+    print(f"\n  {emoji} [{tf}] XAG/USDT (Silver) Futures — {sig['dir']}  |  Conf: {sig['conf']}%")
+    print(f"     Execution Price: {sig['price']} | RSI: {sig['rsi']} | Order Wall Imbalance: {sig['ob_ratio']}x")
+    print(f"     📍 Entry Target : {plan['entry']}")
+    print(f"     🛑 Stop Loss   : {plan['stop']}  (Risk Allocated: ${plan['risk_$']:.2f})")
+    print(f"     🎯 Take Profit 1: {plan['tp1']}")
+    print(f"     🎯 Take Profit 2: {plan['tp2']}")
+    print(f"     🎯 Take Profit 3: {plan['tp3']}")
+    print(f"     📊 Capital Allocation Units: {plan['units']} Contracts (${plan['value']:,.2f} total exposure size)")
+    if verbose:
+        print("     Validation Audit Trail Log:")
+        for n in sig['notes']:
+            print(f"       {n}")
+
+# ============================================
+# MAIN MATRIX CONTROL RUN
+# ============================================
+
+def run_scan(timeframes, account_size, risk_pct, use_bias, verbose, min_conf):
+    print(f"\n{'='*70}")
+    print(f"  📡 XAG PRECISION COMMODITY ENGINE — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"{'='*70}")
+
+    bias, score, bias_details = get_xag_trend_bias()
+    icon = '🟢' if 'BULLISH' in bias else ('🔴' if 'BEARISH' in bias else '⚪')
+    print(f"  {icon}  XAG METALS BIAS CONFIGURATION: {bias} (Score matrix value: {score:+.0f})")
+    print(f"{'='*70}")
+
+    for tf in timeframes:
+        print(f"  ⏱️  Evaluating pricing models and live order books for [{tf}] Silver arrays...")
+        df = fetch_ohlcv('XAG/USDT', tf, limit=TF_PARAMS[tf]['lookback'] + 20)
+        if df is None:
+            continue
+
+        signals = detect_xag_signals(df, tf, bias, use_bias=use_bias)
+        signals = [s for s in signals if s['conf'] >= min_conf]
+
+        if not signals:
+            print(f"  ⏳ [{tf}] No qualifying validation signatures discovered in range metrics.")
+        else:
+            for sig in signals:
+                plan = build_trade_plan(sig, tf, account_size, risk_pct)
+                print_signal(sig, plan, tf, verbose=verbose)
+    print(f"{'='*70}\n")
+
+def main():
+    args = parse_args()
+    if args.timeframe not in ('5m', '15m', '30m'):
+        print("❌ System error: Valid parameters require 5m, 15m, or 30m selections.")
+        sys.exit(1)
+
+    timeframes = [args.timeframe]
+    use_bias = not args.no_bias
+
+    if args.loop > 0:
+        print(f"🔁 Live operational monitoring initialized. Tracking intervals every {args.loop}m.")
+        while True:
+            try:
+                # Fixed: changed args.args.min_conf to args.min_conf
+                run_scan(timeframes, args.account, args.risk, use_bias, args.verbose, args.min_conf)
+                time.sleep(args.loop * 60)
+            except KeyboardInterrupt:
+                print("\n👋 Loop mode stopped.")
+                break
+    else:
+        run_scan(timeframes, args.account, args.risk, use_bias, args.verbose, args.min_conf)
+
+if __name__ == '__main__':
+    main()
