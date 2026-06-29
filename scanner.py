@@ -663,13 +663,18 @@ def write_to_feed(signals, timeframe, feed_path="./data/alerts.json"):
         conf = round(sig["confidence"], 1)
         direction = "buy" if "BUY" in sig["signal_type"] else "sell"
         
+        # Normalise to cTrader symbol format: base currency + "USD" (e.g. BCH/USDT -> BCHUSD).
+        # Handles slash pairs (BCH/USDT), futures (XAU/USDT:USDT), concatenated pairs
+        # (BCHUSDT), and is idempotent for already-converted symbols (XAUUSD -> XAUUSD).
         raw_symbol = sig["symbol"]
         if ":" in raw_symbol:
-            raw_symbol = raw_symbol.split(":")[0]
+            raw_symbol = raw_symbol.split(":")[0]   # drop futures settlement suffix
         if "/" in raw_symbol:
-            # Fix #9: use USDT suffix to match exchange convention (e.g. BTCUSDT not BTCUSD)
-            raw_symbol = raw_symbol.split("/")[0] + "USDT"
-        symbol = raw_symbol
+            symbol = raw_symbol.split("/")[0] + "USD"   # slash pair -> base + USD
+        elif raw_symbol.endswith("USDT"):
+            symbol = raw_symbol[:-4] + "USD"            # concatenated USDT pair -> base + USD
+        else:
+            symbol = raw_symbol                          # already USD (or other) -> unchanged
 
         entry = {
             "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),

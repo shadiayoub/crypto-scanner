@@ -459,7 +459,7 @@ def build_feed_entry(sig, plan, tf):
     direction = 'buy' if sig['dir'] == 'BUY' else 'sell'
     return {
         'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-        'symbol': 'XAGUSDT',
+        'symbol': 'XAGUSD',
         'timeframe': tf,
         'direction': direction,
         'rsi': sig['rsi'],
