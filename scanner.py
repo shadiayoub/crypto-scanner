@@ -123,7 +123,7 @@ SPOT_SYMBOLS = [
     'BCH/USDT', 'BNB/USDT', 'BONK/USDT', 'CRV/USDT', 'DOT/USDT',
     'ETC/USDT', 'FIL/USDT', 'HBAR/USDT', 'INJ/USDT', 'JTO/USDT',
     'JUP/USDT', 'KAITO/USDT', 'LDO/USDT', 'LIT/USDT', 'LTC/USDT',
-    'ONDO/USDT', 'ORDI/USDT', 'PENGU/USDT', 'PNUT/USDT',
+    'ONDO/USDT', 'PENGU/USDT', 'PNUT/USDT',
     'POL/USDT', 'PUMP/USDT', 'RENDER/USDT', 'S/USDT',
     'SHIB/USDT', 'STX/USDT', 'TAO/USDT', 'TIA/USDT',
     'TRX/USDT', 'UNI/USDT', 'VIRTUAL/USDT', 'WLD/USDT', 
@@ -660,7 +660,7 @@ def write_to_feed(signals, timeframe, feed_path="./data/alerts.json"):
     
     feed_entries = []
     for sig in signals:
-        conf = round(sig["confidence"] / 100 * 6, 1)
+        conf = round(sig["confidence"], 1)
         direction = "buy" if "BUY" in sig["signal_type"] else "sell"
         
         raw_symbol = sig["symbol"]

@@ -466,7 +466,7 @@ def build_feed_entry(sig, plan, tf):
         'price': plan['entry'],
         'pivot_level': None,
         'pivot_distance': None,
-        'confidence': round(sig['conf'] / 100 * 6, 1),
+        'confidence': round(sig['conf'], 1),
         'sl': plan['stop'],
         'tp': plan['tp1'],
         'signal_source': 'xag_scanner'

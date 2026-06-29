@@ -12,7 +12,7 @@ module.exports = {
     {
       name: "feed-server",
       script: "python3",
-      args: "-m http.server 8080",
+      args: "-m http.server 8880",
       cwd: "/home/algo/crypto-scanner/data",
       autorestart: true,
       out_file: "/dev/null",
