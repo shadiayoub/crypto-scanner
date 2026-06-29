@@ -13,6 +13,8 @@ import time
 import warnings
 import argparse
 import sys
+import json
+import os
 
 warnings.filterwarnings('ignore')
 
@@ -444,6 +446,60 @@ def print_signal(sig, plan, tf, verbose=False):
             print(f"       {n}")
 
 # ============================================
+# FEED OUTPUT (shared rsi_alerts.json)
+# ============================================
+
+def get_feed_path():
+    # Resolve repo-root/data/rsi_alerts.json from this file's location,
+    # so it works regardless of the process cwd (this script lives in gemeni/).
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo_root, 'data', 'rsi_alerts.json')
+
+def build_feed_entry(sig, plan, tf):
+    direction = 'buy' if sig['dir'] == 'BUY' else 'sell'
+    return {
+        'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        'symbol': 'XAGUSDT',
+        'timeframe': tf,
+        'direction': direction,
+        'rsi': sig['rsi'],
+        'price': plan['entry'],
+        'pivot_level': None,
+        'pivot_distance': None,
+        'confidence': round(sig['conf'] / 100 * 6, 1),
+        'sl': plan['stop'],
+        'tp': plan['tp1'],
+        'signal_source': 'xag_scanner'
+    }
+
+def write_to_feed(entries):
+    if not entries:
+        return
+    feed_path = get_feed_path()
+    try:
+        os.makedirs(os.path.dirname(feed_path), exist_ok=True)
+    except (PermissionError, OSError):
+        feed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rsi_alerts.json')
+
+    existing = []
+    if os.path.exists(feed_path):
+        with open(feed_path, 'r') as f:
+            try:
+                existing = json.load(f)
+            except json.JSONDecodeError:
+                existing = []
+
+    combined = (entries + existing)[:500]
+    tmp_path = feed_path + '.tmp'
+    try:
+        with open(tmp_path, 'w') as f:
+            json.dump(combined, f, indent=2)
+        os.replace(tmp_path, feed_path)
+        print(f"✅ Wrote {len(entries)} signal(s) to {feed_path}")
+    except (PermissionError, OSError) as e:
+        print(f"⚠️ Could not write to feed: {e}")
+
+# ============================================
 # MAIN MATRIX CONTROL RUN
 # ============================================
 
@@ -457,6 +513,7 @@ def run_scan(timeframes, account_size, risk_pct, use_bias, verbose, min_conf):
     print(f"  {icon}  MACRO BIAS: {bias} (Score: {score:+.0f}) | Session: {get_trading_session()}")
     print(f"{'='*70}")
 
+    feed_entries = []
     for tf in timeframes:
         print(f"  ⏱️  Scanning [{tf}]...")
         df = fetch_ohlcv('XAG/USDT', tf, limit=TF_PARAMS[tf]['lookback'] + 20)
@@ -472,6 +529,9 @@ def run_scan(timeframes, account_size, risk_pct, use_bias, verbose, min_conf):
             for sig in signals:
                 plan = build_trade_plan(sig, tf, account_size, risk_pct)
                 print_signal(sig, plan, tf, verbose=verbose)
+                feed_entries.append(build_feed_entry(sig, plan, tf))
+
+    write_to_feed(feed_entries)
     print(f"{'='*70}\n")
 
 def main():
