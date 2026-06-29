@@ -1,0 +1,1 @@
+pm2 start v2-xag-scanner-gemini.py --name xag-scanner --interpreter python3 -- -tf 15m --loop 5

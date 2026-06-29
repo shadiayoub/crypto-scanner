@@ -654,7 +654,7 @@ def calculate_position_size(price, stop_loss, confidence, account_size, risk_per
 # FEED WRITER
 # ============================================
 
-def write_to_feed(signals, timeframe, feed_path="./data/rsi_alerts.json"):
+def write_to_feed(signals, timeframe, feed_path="./data/alerts.json"):
     if not signals:
         return
     
@@ -693,7 +693,7 @@ def write_to_feed(signals, timeframe, feed_path="./data/rsi_alerts.json"):
     try:
         os.makedirs(os.path.dirname(feed_path), exist_ok=True)
     except (PermissionError, OSError):
-        feed_path = "./rsi_alerts.json"
+        feed_path = "./alerts.json"
     
     existing = []
     if os.path.exists(feed_path):

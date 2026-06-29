@@ -446,14 +446,14 @@ def print_signal(sig, plan, tf, verbose=False):
             print(f"       {n}")
 
 # ============================================
-# FEED OUTPUT (shared rsi_alerts.json)
+# FEED OUTPUT (shared alerts.json)
 # ============================================
 
 def get_feed_path():
-    # Resolve repo-root/data/rsi_alerts.json from this file's location,
+    # Resolve repo-root/data/alerts.json from this file's location,
     # so it works regardless of the process cwd (this script lives in gemeni/).
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(repo_root, 'data', 'rsi_alerts.json')
+    return os.path.join(repo_root, 'data', 'alerts.json')
 
 def build_feed_entry(sig, plan, tf):
     direction = 'buy' if sig['dir'] == 'BUY' else 'sell'
@@ -479,7 +479,7 @@ def write_to_feed(entries):
     try:
         os.makedirs(os.path.dirname(feed_path), exist_ok=True)
     except (PermissionError, OSError):
-        feed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rsi_alerts.json')
+        feed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'alerts.json')
 
     existing = []
     if os.path.exists(feed_path):
