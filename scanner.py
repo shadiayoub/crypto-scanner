@@ -28,8 +28,43 @@ import argparse
 import sys
 import json
 import os
+import importlib.util
 warnings.filterwarnings('ignore')
-    
+
+# ============================================
+# BTC MACRO BIAS (from btc-scanner.py)
+# ============================================
+# The dedicated BTC scanner (btc-scanner.py, by the team) owns the canonical
+# "macro bias" read. We reuse its get_btc_trend_bias() verbatim so the feed's
+# btc_state always agrees with that scanner — no duplicated/divergent logic.
+# The filename has a hyphen, so it can't be imported normally; load by path.
+def _load_btc_scanner():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "btc-scanner.py")
+    spec = importlib.util.spec_from_file_location("btc_scanner", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+try:
+    _BTC_SCANNER = _load_btc_scanner()
+except Exception as e:
+    print(f"⚠️ could not load btc-scanner.py for macro bias: {str(e)[:80]}")
+    _BTC_SCANNER = None
+
+def get_btc_macro_bias():
+    """BTC macro bias via btc-scanner.py's get_btc_trend_bias().
+    Returns (bias_string, score). bias ∈ {BEARISH_STRONG, BEARISH, NEUTRAL,
+    BULLISH, BULLISH_STRONG}. Falls back to NEUTRAL on any error."""
+    if _BTC_SCANNER is None:
+        return "NEUTRAL", 0.0
+    try:
+        bias, score, _ = _BTC_SCANNER.get_btc_trend_bias()
+        return bias, score
+    except Exception as e:
+        print(f"⚠️ BTC macro bias error: {str(e)[:60]}")
+        return "NEUTRAL", 0.0
+
+
 # ============================================
 # ARGUMENT PARSING
 # ============================================
@@ -575,64 +610,6 @@ def check_timeframe_confirmation(symbol, timeframe, rsi_period, signal_direction
         confirms = rsi_val > (100 - rsi_threshold)  # overbought on higher TF → bearish
 
     return confirms, round(rsi_val, 2)
-
-# ============================================
-# BTC MARKET STATE (DISPLAY ONLY)
-# ============================================
-
-def get_btc_market_state_higher_tf(timeframe, threshold=1.5):
-    try:
-        if timeframe in ['1m', '5m', '15m']:
-            tfs_to_check = ['1h', '4h']
-        elif timeframe in ['30m', '1h']:
-            tfs_to_check = ['4h', '1d']
-        else:
-            tfs_to_check = ['1d']
-        
-        states = []
-        changes = []
-        
-        for tf in tfs_to_check:
-            df = fetch_data('BTC/USDT', tf, limit=20)
-            if df is None or len(df) < 10:
-                continue
-            
-            close = df['close'].values
-            current_price = close[-1]
-            price_5_ago = close[-5] if len(close) >= 5 else current_price
-            price_10_ago = close[-10] if len(close) >= 10 else current_price
-            
-            change_5 = ((current_price - price_5_ago) / price_5_ago) * 100
-            change_10 = ((current_price - price_10_ago) / price_10_ago) * 100
-            avg_change = (change_5 + change_10) / 2
-            
-            if avg_change > threshold * 2:
-                state = 'STRONG_BULLISH'
-            elif avg_change > threshold:
-                state = 'BULLISH'
-            elif avg_change < -threshold * 2:
-                state = 'STRONG_BEARISH'
-            elif avg_change < -threshold:
-                state = 'BEARISH'
-            else:
-                state = 'NEUTRAL'
-            
-            states.append(state)
-            changes.append(avg_change)
-        
-        if len(states) >= 2:
-            priority = {'STRONG_BEARISH': 0, 'BEARISH': 1, 'NEUTRAL': 2, 'BULLISH': 3, 'STRONG_BULLISH': 4}
-            worst_state = min(states, key=lambda x: priority.get(x, 2))
-            worst_change = changes[states.index(worst_state)]
-            return worst_state, worst_change, tfs_to_check[0]
-        elif len(states) == 1:
-            return states[0], changes[0], tfs_to_check[0]
-        else:
-            return 'NEUTRAL', 0.0, 'unknown'
-        
-    except Exception as e:
-        print(f"⚠️ BTC state check error: {str(e)[:60]}")
-        return 'NEUTRAL', 0.0, 'unknown'
 
 # ============================================
 # POSITION SIZING CALCULATOR
@@ -1230,9 +1207,9 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     params = get_timeframe_params(timeframe)
     results = []
     
-    # Get BTC market state for display
-    btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=1.5)
-    
+    # BTC macro bias from btc-scanner.py (canonical source; same value it reports)
+    btc_state, btc_score = get_btc_macro_bias()
+
     print(f"\n{'='*110}")
     print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*110}")
@@ -1240,7 +1217,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
     print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
     print(f"Symbols: {len(SPOT_SYMBOLS)} crypto + {len(BINANCE_FUTURES_SYMBOLS)} gold (Binance) | cTrader bypassed")
-    print(f"BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
+    print(f"BTC Macro Bias: {btc_state} (Score: {btc_score:+.0f})")
     print(f"Filters: Squeeze={'✅' if use_squeeze else '❌'} | SMRE={'✅' if use_smre else '❌'} | SMC={'✅' if use_smc else '❌'}")
     print(f"{'='*110}\n")
     
@@ -1449,7 +1426,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     write_to_feed(signals_df.to_dict('records'), timeframe, btc_state=btc_state)
 
     # Display BTC state again after scan
-    print(f"\n📊 Final BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
+    print(f"\n📊 Final BTC Macro Bias: {btc_state} (Score: {btc_score:+.0f})")
 
     return df_results
 
