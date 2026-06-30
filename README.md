@@ -7,30 +7,47 @@ A professional-grade cryptocurrency and metals scanner powered by the **Nadaraya
 ## 📁 Repository Structure
 
 ```
-scanner-bot/
-├── scanner.py              # Multi-asset scanner (all timeframes via CLI)
-├── btc-scanner.py          # BTC-focused intraday scanner (15m/30m, trend-aware)
+crypto-scanner/
+├── scanner.py              # Multi-asset scanner (crypto + metals, all timeframes via CLI)
+├── xag-scanner.py          # Dedicated Silver (XAG) scanner — see README-xag.md
+├── btc-scanner.py          # Standalone BTC intraday scanner — see README-btc.md
+├── ecosystem.config.js     # pm2 process definitions (production stack)
+├── run.sh                  # One-time pm2 bootstrap (log rotation + start)
+├── data/
+│   └── alerts.json         # Signal feed written by the scanners, served on :8880
+├── logs/                   # pm2 log files (rotated)
 ├── usage.txt               # Quick reference for commands
 ├── README.md               # This file
-└── logs.txt                # Optional log file
+├── README-xag.md           # Silver scanner docs
+└── README-btc.md           # BTC intraday scanner docs
 ```
 
 ---
 
 ## 🎯 Overview
 
-This repository contains two scanners:
+The production system is a **pm2-managed stack** built around `scanner.py`, which scans the
+market on a loop and publishes signals to `data/alerts.json` (served over HTTP). Two companion
+scanners cover specialised cases:
 
-| Scanner | Focus | Best For |
-|---------|-------|----------|
-| `scanner.py` | 53 assets (51 crypto + 2 metals) | Swing/position trading, multi-asset scanning |
-| `btc-scanner.py` | BTC/USDT only | Intraday trading, riding the dominant BTC trend |
+| Scanner | Focus | Role |
+|---------|-------|------|
+| `scanner.py` | 51 assets (49 crypto + 2 metals) | **Primary** — multi-asset scan, writes the signal feed |
+| `xag-scanner.py` | Silver (XAG) only | Dedicated silver scanner (see [README-xag.md](README-xag.md)) |
+| `btc-scanner.py` | BTC/USDT only | Optional standalone intraday tool (see [README-btc.md](README-btc.md)) |
 
-Both use the **Nadaraya-Watson Envelope** as their core signal engine, with layered confirmation filters and automated position sizing.
+All use the **Nadaraya-Watson Envelope** as their core signal engine, with layered confirmation
+filters and automated position sizing.
+
+> **Quick start (production):** `./run.sh` — boots the whole stack under pm2. See
+> [Live Deployment](#-live-deployment-pm2) below.
 
 ---
 
 ## 🚀 BTC Intraday Scanner (`btc-scanner.py`)
+
+> Standalone, optional tool — **not** part of the pm2 stack and independent of `scanner.py`'s feed.
+> Run it directly when you want a BTC-only intraday view.
 
 ### Overview
 
@@ -191,16 +208,51 @@ python btc-scanner.py --loop 15
 
 ### Overview
 
-Scans 53 assets (51 cryptocurrencies + Gold and Silver perpetuals) across any timeframe from 1m to 1d. Mean-reversion focused, with Squeeze Momentum, SMRE statistical filters, and built-in Smart Money Concepts (BOS, CHoCH, Order Blocks, FVGs).
+Scans 51 assets (49 cryptocurrencies + Gold and Silver perpetuals) across any timeframe from 1m to 1d. Mean-reversion focused, with Squeeze Momentum, SMRE statistical filters, and built-in Smart Money Concepts (BOS, CHoCH, Order Blocks, FVGs).
 
-*Note: The **BTC filter** state is displayed for context only and does not affect signal generation.*
+### BTC Market State
+
+On every scan, `scanner.py` reads BTC on the higher timeframes (relative to the scan TF) and
+buckets the averaged 5- and 10-bar momentum into one of five states:
+
+`STRONG_BULLISH` · `BULLISH` · `NEUTRAL` · `BEARISH` · `STRONG_BEARISH`
+
+This state is **printed for context**, **attached to every crypto signal** in the feed as the
+`btc_state` field (metals carry `null` — only crypto tracks BTC), and **adjusts crypto signal
+confidence** in a direction-aware way.
+
+#### Confidence adjustment
+
+In a bearish BTC regime, longs are faded and shorts are favoured. The deltas (percentage points)
+are defined in the `BTC_STATE_CONFIDENCE_ADJ` dict near the top of `scanner.py` and are easily
+tunable:
+
+| BTC state | BUY signals | SELL signals |
+|-----------|-------------|--------------|
+| `STRONG_BEARISH` | −20 | +20 |
+| `BEARISH` | −10 | +10 |
+| `NEUTRAL` | 0 | 0 |
+| `BULLISH` | 0 | 0 |
+| `STRONG_BULLISH` | 0 | 0 |
+
+- Applies to **crypto only** — metals (XAU/XAG) are never adjusted.
+- The delta is **added** to confidence, then clamped to `[0, 100]`. A SELL at 90 in
+  `STRONG_BEARISH` becomes 100 (not 110); a BUY at 90 becomes 70.
+- After the adjustment, the usual **50% floor** applies — a BUY penalised below 50 is dropped.
+- The adjusted confidence also feeds position sizing and take-profit scaling, so a penalised
+  signal also gets a smaller position.
+- Bullish and neutral states are no-ops; set non-zero values in the dict to change that.
+
+> Distinct from `btc-scanner.py`'s trend-bias system (the `BEARISH_STRONG`-style labels in the
+> [BTC Intraday Scanner](#-btc-intraday-scanner-btc-scannerpy) section), which *does* gate that
+> scanner's own signals.
 
 ### Features
 
 - **Nadaraya-Watson Envelope** (adaptive bandwidth per timeframe)
 - **RSI** for momentum confirmation (period adjusts per timeframe)
 - **5 Signal Types**: Crossover, Oversold/Overbought Bounce, Envelope Extreme
-- **58+ Assets**: Top cryptocurrencies + Gold (XAU) & Silver (XAG) futures
+- **51 Assets**: 49 cryptocurrencies + Gold (XAU) & Silver (XAG) futures
 
 ### Filter System
 
@@ -235,7 +287,7 @@ Identifies 3-candle institutional gaps. Adds +10% confidence if price is in an F
 ### Usage
 
 ```bash
-# Default: 1h timeframe, all 53 assets
+# Default: 1h timeframe, all 51 assets
 python scanner.py
 
 # 15-minute timeframe (day trading)
@@ -276,6 +328,7 @@ python scanner.py --help
 | `--no-squeeze` | Disable Squeeze Momentum filter | `False` |
 | `--no-smre` | Disable SMRE Statistical filter | `False` |
 | `--no-smc` | Disable Smart Money Concepts filter | `False` |
+| `--loop N` | Repeat the scan every N minutes, keeping the process alive (0 = single run) | `0` |
 
 ### Timeframe Parameters
 
@@ -288,20 +341,25 @@ python scanner.py --help
 | **4h-6h** | 500 | 7.0 | 3.5 | 14 | 200 | 2.0% | 4%/7%/10% |
 | **12h-1d** | 500 | 8.0 | 4.0 | 14 | 200 | 2.0% | 4%/7%/10% |
 
-### Scheduling Examples
+### Scheduling
+
+The recommended approach is the built-in `--loop` flag under pm2 (see
+[Live Deployment](#-live-deployment-pm2)) — the process stays resident and the loop sleeps to the
+next wall-clock boundary, so scans land on round times:
 
 ```bash
-# Scalping (5m) - Run every 5 minutes
-*/5 * * * * cd /path/to/scanner && python scanner.py -tf 5m
+# Scan every 15 minutes, continuously (used by the pm2 stack)
+python scanner.py -tf 30m --loop 15
+```
 
-# Day trading (15m) - Run every 15 minutes
-*/15 * * * * cd /path/to/scanner && python scanner.py -tf 15m
+Plain cron also works if you prefer single-shot runs:
 
-# Swing trading (1h) - Run every 2 hours
-0 */2 * * * cd /path/to/scanner && python scanner.py -tf 1h
+```bash
+# Day trading (15m) - run every 15 minutes
+*/15 * * * * cd /path/to/crypto-scanner && python scanner.py -tf 15m
 
-# Position trading (4h) - Run every 4 hours
-0 */4 * * * cd /path/to/scanner && python scanner.py -tf 4h
+# Swing trading (1h) - run every 2 hours
+0 */2 * * * cd /path/to/crypto-scanner && python scanner.py -tf 1h
 ```
 
 ---
@@ -310,11 +368,77 @@ python scanner.py --help
 
 ```bash
 git clone https://github.com/shadiayoub/crypto-scanner
-cd scanner-bot
+cd crypto-scanner
 pip install ccxt pandas numpy
 ```
 
-No additional setup required. Both scanners are pre-configured with optimised parameters.
+The scanners run standalone with just the Python dependencies above. For the production stack you
+also need **Node.js + pm2** (`npm install -g pm2`).
+
+---
+
+## 🚀 Live Deployment (pm2)
+
+The production stack runs under [pm2](https://pm2.keymetrics.io/) and is defined in
+`ecosystem.config.js`:
+
+| Process | Command | Purpose |
+|---------|---------|---------|
+| `signal-scanner` | `scanner.py -tf 30m --loop 15` | Crypto + metals scan every 15 min, writes the feed |
+| `xag-scanner` | `xag-scanner.py -tf 15m --loop 5` | Dedicated silver scan |
+| `feed-server` | `python -m http.server 8880` (in `data/`) | Serves `alerts.json` over HTTP on **:8880** |
+
+Each scanner uses its built-in `--loop`, so the processes stay **continuously online** (no cron
+restarts, no "stopped" flapping) and the loop sleeps to the next wall-clock boundary.
+
+### First-time setup
+
+```bash
+./run.sh
+```
+
+`run.sh` installs and configures the **pm2-logrotate** module (caps each log at 10 MB, keeps 5
+rotated + gzipped files), then starts the stack and saves it. After that, day-to-day you only need:
+
+```bash
+pm2 start ecosystem.config.js   # start the stack
+pm2 logs signal-scanner         # tail the scanner logs (logs/signal-scanner.log)
+pm2 restart signal-scanner      # apply code changes (the loop holds code in memory)
+pm2 save                        # persist the process list
+pm2 resurrect                   # restore the saved stack after a reboot
+```
+
+> **Note:** because each scanner runs a resident `--loop`, edits to `scanner.py` are only picked up
+> after `pm2 restart signal-scanner`.
+
+---
+
+## 📡 Signal Feed (`data/alerts.json`)
+
+Every scan appends its signals to `data/alerts.json` (newest first, capped at 500 entries),
+written atomically and served by the `feed-server` on port **8880**. Each entry:
+
+```json
+{
+  "timestamp": "2026-06-30 14:15:36",
+  "symbol": "TIAUSD",
+  "timeframe": "30m",
+  "direction": "buy",
+  "rsi": 27.47,
+  "price": 0.3636,
+  "pivot_level": null,
+  "pivot_distance": null,
+  "confidence": 60.6,
+  "sl": 0.3552,
+  "tp": 0.3647,
+  "btc_state": "STRONG_BEARISH",
+  "signal_source": "signal_scanner"
+}
+```
+
+- **Symbols** are normalised to `<BASE>USD` (e.g. `TIA/USDT` → `TIAUSD`, `XAU/USDT:USDT` → `XAUUSD`).
+- **`btc_state`** carries the current BTC market state for **crypto** signals; **metals** (XAU/XAG)
+  carry `null` since they don't track BTC.
 
 ---
 
@@ -336,8 +460,8 @@ No additional setup required. Both scanners are pre-configured with optimised pa
 ### `btc-scanner.py`
 - **BTC/USDT** (spot, 15m and 30m only)
 
-### `scanner.py` — Cryptocurrencies (51)
-BTC, ETH, SOL, XRP, DOGE, LINK, AVAX, SUI, NEAR, WIF, ARB, OP, AAVE, ADA, AIXBT, ALGO, APT, ASTER, ATOM, BCH, BNB, BONK, CRV, DOT, ETC, FIL, HBAR, INJ, JTO, JUP, KAITO, LDO, LIT, LTC, ONDO, ORDI, PENGU, PNUT, POL, PUMP, RENDER, S, SHIB, STX, TAO, TIA, TRX, UNI, VIRTUAL, WLD, ZEC
+### `scanner.py` — Cryptocurrencies (49)
+BTC, ETH, SOL, XRP, LINK, AVAX, SUI, NEAR, WIF, ARB, OP, AAVE, ADA, AIXBT, ALGO, APT, ASTER, ATOM, BCH, BNB, BONK, CRV, DOT, ETC, FIL, HBAR, INJ, JTO, JUP, KAITO, LDO, LIT, LTC, ONDO, PENGU, PNUT, POL, PUMP, RENDER, S, SHIB, STX, TAO, TIA, TRX, UNI, VIRTUAL, WLD, ZEC
 
 ### `scanner.py` — Precious Metals (2)
 - **XAU/USDT:USDT** (Gold Perpetual)
@@ -370,6 +494,7 @@ BTC, ETH, SOL, XRP, DOGE, LINK, AVAX, SUI, NEAR, WIF, ARB, OP, AAVE, ADA, AIXBT,
 
 | Version | File | Changes |
 |---------|------|---------|
+| **v5.0** | stack | pm2 production stack (`ecosystem.config.js` + `run.sh`); `scanner.py` `--loop` mode (always-on, wall-clock aligned); BTC market state attached to crypto signals in `data/alerts.json` (`btc_state`, null for metals); direction-aware BTC-state confidence adjustment (`BTC_STATE_CONFIDENCE_ADJ`); `feed-server` on :8880; log rotation |
 | **v4.0** | `btc-scanner.py` | New BTC-only intraday scanner; trend bias system (1h+4h macro scoring); 15m/30m optimised parameters; loop mode; tighter stops sized for BTC intraday volatility |
 | **v3.1** | `scanner.py` | Bug fixes: Wilder's RSI smoothing, corrected Hurst exponent, squeeze release logic, BUY_/SELL_ extreme signal prefixes, directional HTF confirmation, removed broken smc-toolkit dependency (built-in SMC), USDT symbol normalisation, UTC timestamp |
 | **v3.0** | `scanner.py` | Unified scanner with CLI arguments, 3 TP targets, enhanced filters |

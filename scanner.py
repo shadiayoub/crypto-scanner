@@ -147,6 +147,30 @@ FUTURES_SYMBOLS = [
 SYMBOLS = SPOT_SYMBOLS + FUTURES_SYMBOLS
 
 # ============================================
+# BTC-STATE CONFIDENCE ADJUSTMENT
+# ============================================
+# Direction-aware confidence adjustment (in percentage points) applied to CRYPTO
+# signals based on the current BTC market state. Metals (XAU/XAG) are never
+# affected. Bullish and neutral states have no effect. Tune freely; 0 = no effect.
+#   - In a bearish BTC regime, fade longs (penalise BUYs) and favour shorts (boost SELLs).
+BTC_STATE_CONFIDENCE_ADJ = {
+    'BUY': {
+        'STRONG_BEARISH': -20,
+        'BEARISH':        -10,
+        'NEUTRAL':          0,
+        'BULLISH':          0,
+        'STRONG_BULLISH':   0,
+    },
+    'SELL': {
+        'STRONG_BEARISH': +20,
+        'BEARISH':        +10,
+        'NEUTRAL':          0,
+        'BULLISH':          0,
+        'STRONG_BULLISH':   0,
+    },
+}
+
+# ============================================
 # TIMEFRAME-SPECIFIC PARAMETERS
 # ============================================
 
@@ -827,7 +851,7 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
 # ENHANCED SIGNAL DETECTION WITH SQUEEZE + SMRE + SMC
 # ============================================
 
-def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol, params, use_squeeze=True, use_smre=True, use_smc=True):
+def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol, params, use_squeeze=True, use_smre=True, use_smc=True, btc_state=None):
     current = price[-1]
     prev = price[-2]
     signals = []
@@ -1159,8 +1183,17 @@ def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol,
         # ============================================
         # FINAL CONFIDENCE CALCULATION
         # ============================================
+        # BTC market-state adjustment (crypto only, direction-aware). Metals carry no
+        # BTC dependence, so they're excluded. See BTC_STATE_CONFIDENCE_ADJ to tune.
+        if symbol not in FUTURES_SYMBOLS and btc_state:
+            direction = 'BUY' if signal['type'].startswith('BUY') else 'SELL'
+            adj = BTC_STATE_CONFIDENCE_ADJ.get(direction, {}).get(btc_state, 0)
+            if adj:
+                confidence += adj
+                filters_triggered.append(f"₿ BTC {btc_state}: {adj:+d} conf")
+
         confidence = max(0, min(100, confidence))
-        
+
         if confidence < 50:
             skip_signal = True
         
@@ -1233,7 +1266,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             
             signals = detect_signals(
                 close, high, low, volume, rsi_val, lower, upper, mid, symbol, params,
-                use_squeeze=use_squeeze, use_smre=use_smre, use_smc=use_smc
+                use_squeeze=use_squeeze, use_smre=use_smre, use_smc=use_smc, btc_state=btc_state
             )
             
             if signals:
