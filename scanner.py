@@ -134,14 +134,19 @@ SPOT_SYMBOLS = [
 # Instruments sourced from cTrader instead of Binance — more accurate prices
 # since we trade on cTrader. Crypto stays on Binance via ccxt; metals (and later
 # forex/indices) come from cTrader as spot CFDs (XAUUSD/XAGUSD, not USDT perps).
-CTRADER_SYMBOLS = [
-    'XAUUSD',  # Gold spot (cTrader)
-    'XAGUSD',  # Silver spot (cTrader)
-]
+# ── TEMPORARY (2026-06-29): cTrader forex/indices/commodity signals caused
+# losses, so cTrader sourcing is BYPASSED. Gold is served from Binance again
+# (as it was before the cTrader switch); silver is excluded entirely because
+# xag-scanner.py is its dedicated scanner. To re-enable cTrader, restore the
+# symbol list here (the routing + ctrader_feed code is untouched). ──────────
+CTRADER_SYMBOLS = []  # bypassed — no forex/indices/commodities from cTrader
 CTRADER_SYMBOL_SET = set(CTRADER_SYMBOLS)
 
-# Combine all symbols
-SYMBOLS = SPOT_SYMBOLS + CTRADER_SYMBOLS
+# Gold back on Binance USD-M futures (XAU/USDT:USDT -> normalised to XAUUSD).
+BINANCE_FUTURES_SYMBOLS = ['XAU/USDT:USDT']
+
+# Combine all symbols: crypto (Binance) + gold (Binance). No cTrader, no silver.
+SYMBOLS = SPOT_SYMBOLS + BINANCE_FUTURES_SYMBOLS
 
 # ============================================
 # TIMEFRAME-SPECIFIC PARAMETERS
@@ -732,7 +737,22 @@ def write_to_feed(signals, timeframe, feed_path="./data/alerts.json"):
 # SUGGESTED ENTRY/EXIT PRICES (3 TARGETS)
 # ============================================
 
-def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_val, params, rsi_1h=None):
+# ATR-based SL/TP for cTrader instruments (FX/indices/metals): their moves aren't
+# comparable to crypto's percentage swings, so size stops/targets by volatility.
+ATR_PERIOD = 14
+ATR_STOP_MULT = 1.5
+ATR_TP_MULTS = (1.5, 3.0, 4.5)  # ~1R / 2R / 3R relative to the ATR stop
+
+def atr(high, low, close, period=ATR_PERIOD):
+    """Average True Range — sizes SL/TP for cTrader instruments by volatility."""
+    h, l, c = np.asarray(high, float), np.asarray(low, float), np.asarray(close, float)
+    if len(h) < period + 1:
+        return float(h[-1] - l[-1])
+    tr = np.maximum(h[1:] - l[1:],
+                    np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
+    return float(np.mean(tr[-period:]))
+
+def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_val, params, rsi_1h=None, atr_value=None):
     result = {
         'entry': price,
         'stop_loss': None,
@@ -768,18 +788,23 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
         entry = max(adjusted_entry, lower * 1.005)
         result['entry'] = round(entry, 4)
         
-        stop = min(price * (1 - stop_distance), lower * (1 - stop_distance * 0.4))
+        if atr_value is not None and atr_value > 0:
+            # volatility-scaled exits (cTrader FX/indices/metals)
+            stop = entry - atr_value * ATR_STOP_MULT
+            tp1 = entry + atr_value * ATR_TP_MULTS[0]
+            tp2 = entry + atr_value * ATR_TP_MULTS[1]
+            tp3 = entry + atr_value * ATR_TP_MULTS[2]
+        else:
+            # percentage-based exits (crypto)
+            stop = min(price * (1 - stop_distance), lower * (1 - stop_distance * 0.4))
+            tp1 = min(mid, entry * (1 + tp1_pct * 0.5))
+            if tp1 <= entry:
+                tp1 = entry * (1 + tp1_pct * 0.5)
+            tp2 = entry * (1 + tp1_pct + (confidence / 100) * tp1_pct * 0.5)
+            tp3 = entry * (1 + tp2_pct + (confidence / 100) * tp2_pct * 0.5)
         result['stop_loss'] = round(stop, 4)
-        
-        tp1 = min(mid, entry * (1 + tp1_pct * 0.5))
-        if tp1 <= entry:
-            tp1 = entry * (1 + tp1_pct * 0.5)
         result['take_profit_1'] = round(tp1, 4)
-        
-        tp2 = entry * (1 + tp1_pct + (confidence / 100) * tp1_pct * 0.5)
         result['take_profit_2'] = round(tp2, 4)
-        
-        tp3 = entry * (1 + tp2_pct + (confidence / 100) * tp2_pct * 0.5)
         result['take_profit_3'] = round(tp3, 4)
         
         risk = entry - stop
@@ -795,18 +820,23 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
         entry = min(adjusted_entry, upper * 0.995)
         result['entry'] = round(entry, 4)
         
-        stop = max(price * (1 + stop_distance), upper * (1 + stop_distance * 0.4))
+        if atr_value is not None and atr_value > 0:
+            # volatility-scaled exits (cTrader FX/indices/metals)
+            stop = entry + atr_value * ATR_STOP_MULT
+            tp1 = entry - atr_value * ATR_TP_MULTS[0]
+            tp2 = entry - atr_value * ATR_TP_MULTS[1]
+            tp3 = entry - atr_value * ATR_TP_MULTS[2]
+        else:
+            # percentage-based exits (crypto)
+            stop = max(price * (1 + stop_distance), upper * (1 + stop_distance * 0.4))
+            tp1 = max(mid, entry * (1 - tp1_pct * 0.5))
+            if tp1 >= entry:
+                tp1 = entry * (1 - tp1_pct * 0.5)
+            tp2 = entry * (1 - tp1_pct - (confidence / 100) * tp1_pct * 0.5)
+            tp3 = entry * (1 - tp2_pct - (confidence / 100) * tp2_pct * 0.5)
         result['stop_loss'] = round(stop, 4)
-        
-        tp1 = max(mid, entry * (1 - tp1_pct * 0.5))
-        if tp1 >= entry:
-            tp1 = entry * (1 - tp1_pct * 0.5)
         result['take_profit_1'] = round(tp1, 4)
-        
-        tp2 = entry * (1 - tp1_pct - (confidence / 100) * tp1_pct * 0.5)
         result['take_profit_2'] = round(tp2, 4)
-        
-        tp3 = entry * (1 - tp2_pct - (confidence / 100) * tp2_pct * 0.5)
         result['take_profit_3'] = round(tp3, 4)
         
         risk = stop - entry
@@ -1202,7 +1232,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"Account: ${account_size:,} | Risk: {risk_percent*100:.1f}% per trade | Max Positions: {max_positions}")
     print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
     print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
-    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot (Binance) + {len(CTRADER_SYMBOLS)} cTrader")
+    print(f"Symbols: {len(SPOT_SYMBOLS)} crypto + {len(BINANCE_FUTURES_SYMBOLS)} gold (Binance) | cTrader bypassed")
     print(f"BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
     print(f"Filters: Squeeze={'✅' if use_squeeze else '❌'} | SMRE={'✅' if use_smre else '❌'} | SMC={'✅' if use_smc else '❌'}")
     print(f"{'='*110}\n")
@@ -1236,10 +1266,13 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             if signals:
                 best = signals[0]
                 
+                # cTrader instruments (FX/indices/metals) get ATR-based SL/TP;
+                # crypto stays on the percentage model (atr_value=None).
+                atr_value = atr(high, low, close) if symbol in CTRADER_SYMBOL_SET else None
                 entry_exit = calculate_entry_exit(
                     current_price, lower, upper, mid,
                     best['type'], best['confidence'], rsi_val, params,
-                    rsi_1h=best.get('rsi_1h')
+                    rsi_1h=best.get('rsi_1h'), atr_value=atr_value
                 )
                 
                 position_size = calculate_position_size(

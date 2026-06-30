@@ -464,6 +464,17 @@ def build_feed_entry(sig, plan, tf):
         'signal_source': 'xag_scanner'
     }
 
+def _json_default(o):
+    # Indicator math yields numpy scalars (e.g. int64/float64) that the stdlib
+    # JSON encoder rejects; coerce them to native Python numbers.
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
 def write_to_feed(entries):
     if not entries:
         return
@@ -483,12 +494,13 @@ def write_to_feed(entries):
 
     combined = (entries + existing)[:500]
     tmp_path = feed_path + '.tmp'
+    # Never let a feed-write problem crash the scanner loop.
     try:
         with open(tmp_path, 'w') as f:
-            json.dump(combined, f, indent=2)
+            json.dump(combined, f, indent=2, default=_json_default)
         os.replace(tmp_path, feed_path)
         print(f"✅ Wrote {len(entries)} signal(s) to {feed_path}")
-    except (PermissionError, OSError) as e:
+    except Exception as e:
         print(f"⚠️ Could not write to feed: {e}")
 
 # ============================================

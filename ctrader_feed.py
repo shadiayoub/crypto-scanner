@@ -186,7 +186,8 @@ class CTraderFeed:
                     pass  # incomplete object, read more
             chunk = self.sock.recv(4096)
             if not chunk:
-                raise CTraderError("connection closed by server")
+                # OSError subclass so _with_reconnect treats it as a dropped socket
+                raise ConnectionError("connection closed by server")
             self._buf += self._dec.decode(chunk)
 
     def _request(self, payload_type, payload, expect_type):
@@ -242,6 +243,32 @@ class CTraderFeed:
         self._load_symbols()
         self.authed = True
 
+    def _reset(self):
+        """Drop the current connection so the next call reconnects fresh."""
+        try:
+            if self.sock:
+                self.sock.close()
+        except OSError:
+            pass
+        self.sock = None
+        self.authed = False
+
+    def _with_reconnect(self, fn):
+        """Run fn(), reconnecting once on a socket failure. Long-running loops
+        (e.g. xag-scanner --loop) reuse the connection across minutes, and
+        cTrader drops idle sockets — so transparently re-establish and retry.
+        Only OSError-family failures (incl. ssl.SSLError, ConnectionError)
+        trigger a reconnect; logical CTraderErrors propagate as-is."""
+        last = None
+        for _ in range(2):
+            try:
+                self.connect()
+                return fn()
+            except OSError as e:
+                last = e
+                self._reset()
+        raise CTraderError(f"cTrader connection failed: {last}")
+
     def _account_auth(self):
         self._request(
             PT["ACCOUNT_AUTH_REQ"],
@@ -273,12 +300,13 @@ class CTraderFeed:
         return None
 
     def list_symbols(self, query=None):
-        self.connect()
-        names = sorted(self.symbol_map)
-        if query:
-            q = query.lower()
-            names = [n for n in names if q in n.lower()]
-        return names
+        with self._lock:
+            self._with_reconnect(lambda: None)
+            names = sorted(self.symbol_map)
+            if query:
+                q = query.lower()
+                names = [n for n in names if q in n.lower()]
+            return names
 
     def _request_trendbars(self, symbol_id, period, from_ms, to_ms):
         """One historical request (self-paced + retried on rate limit)."""
@@ -364,28 +392,32 @@ class CTraderFeed:
 
     def get_trendbars(self, symbol, timeframe, count=200):
         with self._lock:
-            self.connect()
-            resolved = self.resolve_symbol(symbol)
-            if resolved is None:
-                raise CTraderError(f"symbol not found on account: {symbol}")
-            symbol_id = self.symbol_map[resolved]
+            return self._with_reconnect(
+                lambda: self._get_trendbars_inner(symbol, timeframe, count)
+            )
 
-            if timeframe in TIMEFRAMES:
-                period, minutes = TIMEFRAMES[timeframe]
-                df = self._fetch_native(symbol_id, period, minutes, count)
-            elif timeframe in DERIVED_TIMEFRAMES:
-                base_tf, ratio = DERIVED_TIMEFRAMES[timeframe]
-                base_period, base_min = TIMEFRAMES[base_tf]
-                raw = self._fetch_native(
-                    symbol_id, base_period, base_min, count * ratio + ratio * 2
-                )
-                df = None if raw is None else self._resample(raw, base_min * ratio)
-            else:
-                raise CTraderError(f"unsupported timeframe: {timeframe}")
+    def _get_trendbars_inner(self, symbol, timeframe, count):
+        resolved = self.resolve_symbol(symbol)
+        if resolved is None:
+            raise CTraderError(f"symbol not found on account: {symbol}")
+        symbol_id = self.symbol_map[resolved]
 
-            if df is None:
-                return None
-            return df.tail(count).reset_index(drop=True)
+        if timeframe in TIMEFRAMES:
+            period, minutes = TIMEFRAMES[timeframe]
+            df = self._fetch_native(symbol_id, period, minutes, count)
+        elif timeframe in DERIVED_TIMEFRAMES:
+            base_tf, ratio = DERIVED_TIMEFRAMES[timeframe]
+            base_period, base_min = TIMEFRAMES[base_tf]
+            raw = self._fetch_native(
+                symbol_id, base_period, base_min, count * ratio + ratio * 2
+            )
+            df = None if raw is None else self._resample(raw, base_min * ratio)
+        else:
+            raise CTraderError(f"unsupported timeframe: {timeframe}")
+
+        if df is None:
+            return None
+        return df.tail(count).reset_index(drop=True)
 
     def close(self):
         try:
