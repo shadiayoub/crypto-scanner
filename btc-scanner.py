@@ -25,6 +25,8 @@ import time
 import warnings
 import argparse
 import sys
+import json
+import os
 
 warnings.filterwarnings('ignore')
 
@@ -1159,6 +1161,73 @@ def print_signal(sig, plan, tf, verbose=False):
             print(f"       {n}")
 
 # ============================================
+# FEED OUTPUT (shared alerts.json)
+# ============================================
+
+def get_feed_path():
+    # Resolve repo-root/data/alerts.json from this file's location,
+    # so it works regardless of the process cwd (this script lives at the repo root).
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(repo_root, 'data', 'alerts.json')
+
+def build_feed_entry(sig, plan, tf):
+    direction = 'buy' if sig['dir'] == 'BUY' else 'sell'
+    return {
+        'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        'symbol': 'BTCUSD',
+        'timeframe': tf,
+        'direction': direction,
+        'rsi': sig['rsi'],
+        'price': plan['entry'],
+        'pivot_level': None,
+        'pivot_distance': None,
+        'confidence': round(sig['conf'], 1),
+        'sl': plan['stop'],
+        'tp': plan['tp1'],
+        'btc_state': None,  # this signal IS BTC — no separate BTC-state annotation
+        'signal_source': 'btc_scanner'
+    }
+
+def _json_default(o):
+    # Indicator math yields numpy scalars (e.g. int64/float64) that the stdlib
+    # JSON encoder rejects; coerce them to native Python numbers.
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+def write_to_feed(entries):
+    if not entries:
+        return
+    feed_path = get_feed_path()
+    try:
+        os.makedirs(os.path.dirname(feed_path), exist_ok=True)
+    except (PermissionError, OSError):
+        feed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'alerts.json')
+
+    existing = []
+    if os.path.exists(feed_path):
+        with open(feed_path, 'r') as f:
+            try:
+                existing = json.load(f)
+            except json.JSONDecodeError:
+                existing = []
+
+    combined = (entries + existing)[:500]
+    tmp_path = feed_path + '.tmp'
+    # Never let a feed-write problem crash the scanner loop.
+    try:
+        with open(tmp_path, 'w') as f:
+            json.dump(combined, f, indent=2, default=_json_default)
+        os.replace(tmp_path, feed_path)
+        print(f"✅ Wrote {len(entries)} signal(s) to {feed_path}")
+    except Exception as e:
+        print(f"⚠️ Could not write to feed: {e}")
+
+# ============================================
 # MAIN SCAN LOOP
 # ============================================
 
@@ -1190,6 +1259,7 @@ def run_scan(timeframes, account_size, risk_pct, use_bias, verbose, min_conf, ma
 
     print(f"{'='*75}")
 
+    feed_entries = []
     for tf in timeframes:
         print(f"  ⏱️  Processing [{tf}] Candlestick & Order Stream Matrix...")
         df = fetch_ohlcv('BTC/USDT', tf, limit=TF_PARAMS[tf]['lookback'] + 30)
@@ -1210,6 +1280,9 @@ def run_scan(timeframes, account_size, risk_pct, use_bias, verbose, min_conf, ma
             for sig in signals:
                 plan = build_trade_plan(sig, tf, account_size, risk_pct, max_risk_pct)
                 print_signal(sig, plan, tf, verbose=verbose)
+                feed_entries.append(build_feed_entry(sig, plan, tf))
+
+    write_to_feed(feed_entries)
     print(f"{'='*75}\n")
 
 def main():

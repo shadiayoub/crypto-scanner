@@ -33,6 +33,17 @@ module.exports = {
       merge_logs: true,
     },
     {
+      name: "btc-scanner",
+      script: "btc-scanner.py",
+      interpreter: "python3",
+      args: "-tf 15m --loop 5",      // btc-scanner has its own internal loop
+      cwd: "/home/algo/crypto-scanner",
+      autorestart: true,
+      out_file: "/home/algo/crypto-scanner/logs/btc-scanner.log",
+      error_file: "/home/algo/crypto-scanner/logs/btc-scanner.log",
+      merge_logs: true,
+    },
+    {
       name: "feed-server",
       script: "python3",
       args: "-m http.server 8880",
