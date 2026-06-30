@@ -20,7 +20,6 @@ SMC Note:
 import ccxt
 import pandas as pd
 import numpy as np
-import ctrader_feed  # cTrader OHLC source for metals/forex/indices (lazy-connects)
 from datetime import datetime
 import time
 import warnings
@@ -28,43 +27,8 @@ import argparse
 import sys
 import json
 import os
-import importlib.util
 warnings.filterwarnings('ignore')
-
-# ============================================
-# BTC MACRO BIAS (from btc-scanner.py)
-# ============================================
-# The dedicated BTC scanner (btc-scanner.py, by the team) owns the canonical
-# "macro bias" read. We reuse its get_btc_trend_bias() verbatim so the feed's
-# btc_state always agrees with that scanner — no duplicated/divergent logic.
-# The filename has a hyphen, so it can't be imported normally; load by path.
-def _load_btc_scanner():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "btc-scanner.py")
-    spec = importlib.util.spec_from_file_location("btc_scanner", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-try:
-    _BTC_SCANNER = _load_btc_scanner()
-except Exception as e:
-    print(f"⚠️ could not load btc-scanner.py for macro bias: {str(e)[:80]}")
-    _BTC_SCANNER = None
-
-def get_btc_macro_bias():
-    """BTC macro bias via btc-scanner.py's get_btc_trend_bias().
-    Returns (bias_string, score). bias ∈ {BEARISH_STRONG, BEARISH, NEUTRAL,
-    BULLISH, BULLISH_STRONG}. Falls back to NEUTRAL on any error."""
-    if _BTC_SCANNER is None:
-        return "NEUTRAL", 0.0
-    try:
-        bias, score, _ = _BTC_SCANNER.get_btc_trend_bias()
-        return bias, score
-    except Exception as e:
-        print(f"⚠️ BTC macro bias error: {str(e)[:60]}")
-        return "NEUTRAL", 0.0
-
-
+    
 # ============================================
 # ARGUMENT PARSING
 # ============================================
@@ -143,7 +107,14 @@ Examples:
         action='store_true',
         help='Disable Smart Money Concepts filter'
     )
-    
+
+    parser.add_argument(
+        '--loop',
+        type=int,
+        default=0,
+        help='Repeat the scan every N minutes, keeping the process alive (0 = single run, default)'
+    )
+
     return parser.parse_args()
 
 # ============================================
@@ -166,22 +137,14 @@ SPOT_SYMBOLS = [
     'ZEC/USDT'
 ]
 
-# Instruments sourced from cTrader instead of Binance — more accurate prices
-# since we trade on cTrader. Crypto stays on Binance via ccxt; metals (and later
-# forex/indices) come from cTrader as spot CFDs (XAUUSD/XAGUSD, not USDT perps).
-# ── TEMPORARY (2026-06-29): cTrader forex/indices/commodity signals caused
-# losses, so cTrader sourcing is BYPASSED. Gold is served from Binance again
-# (as it was before the cTrader switch); silver is excluded entirely because
-# xag-scanner.py is its dedicated scanner. To re-enable cTrader, restore the
-# symbol list here (the routing + ctrader_feed code is untouched). ──────────
-CTRADER_SYMBOLS = []  # bypassed — no forex/indices/commodities from cTrader
-CTRADER_SYMBOL_SET = set(CTRADER_SYMBOLS)
+# Futures symbols (for metals and other perpetuals)
+FUTURES_SYMBOLS = [
+    'XAU/USDT:USDT',  # Gold perpetual
+    'XAG/USDT:USDT'   # Silver perpetual
+]
 
-# Gold back on Binance USD-M futures (XAU/USDT:USDT -> normalised to XAUUSD).
-BINANCE_FUTURES_SYMBOLS = ['XAU/USDT:USDT']
-
-# Combine all symbols: crypto (Binance) + gold (Binance). No cTrader, no silver.
-SYMBOLS = SPOT_SYMBOLS + BINANCE_FUTURES_SYMBOLS
+# Combine all symbols
+SYMBOLS = SPOT_SYMBOLS + FUTURES_SYMBOLS
 
 # ============================================
 # TIMEFRAME-SPECIFIC PARAMETERS
@@ -575,12 +538,6 @@ def get_exchange(is_futures):
 
 def fetch_data(symbol, timeframe, limit=550):
     try:
-        # Route by asset class: cTrader instruments (metals/forex/indices) use the
-        # cTrader feed; everything else (crypto) uses Binance via ccxt. Same
-        # DataFrame shape either way, so downstream indicator code is untouched.
-        if symbol in CTRADER_SYMBOL_SET:
-            return ctrader_feed.get_trendbars(symbol, timeframe, count=limit)
-
         is_futures = ':' in symbol
         exchange = get_exchange(is_futures)
 
@@ -610,6 +567,66 @@ def check_timeframe_confirmation(symbol, timeframe, rsi_period, signal_direction
         confirms = rsi_val > (100 - rsi_threshold)  # overbought on higher TF → bearish
 
     return confirms, round(rsi_val, 2)
+
+# ============================================
+# BTC MARKET STATE (DISPLAY ONLY)
+# ============================================
+
+def get_btc_market_state_higher_tf(timeframe, threshold=1.5):
+    try:
+        if timeframe in ['1m', '5m', '15m']:
+            tfs_to_check = ['1h', '4h']
+        elif timeframe in ['30m', '1h']:
+            tfs_to_check = ['4h', '1d']
+        else:
+            tfs_to_check = ['1d']
+        
+        states = []
+        changes = []
+        tfs_used = []   # parallel to states/changes; a TF may be skipped below
+
+        for tf in tfs_to_check:
+            df = fetch_data('BTC/USDT', tf, limit=20)
+            if df is None or len(df) < 10:
+                continue
+            
+            close = df['close'].values
+            current_price = close[-1]
+            price_5_ago = close[-5] if len(close) >= 5 else current_price
+            price_10_ago = close[-10] if len(close) >= 10 else current_price
+            
+            change_5 = ((current_price - price_5_ago) / price_5_ago) * 100
+            change_10 = ((current_price - price_10_ago) / price_10_ago) * 100
+            avg_change = (change_5 + change_10) / 2
+            
+            if avg_change > threshold * 2:
+                state = 'STRONG_BULLISH'
+            elif avg_change > threshold:
+                state = 'BULLISH'
+            elif avg_change < -threshold * 2:
+                state = 'STRONG_BEARISH'
+            elif avg_change < -threshold:
+                state = 'BEARISH'
+            else:
+                state = 'NEUTRAL'
+            
+            states.append(state)
+            changes.append(avg_change)
+            tfs_used.append(tf)
+
+        if len(states) >= 2:
+            priority = {'STRONG_BEARISH': 0, 'BEARISH': 1, 'NEUTRAL': 2, 'BULLISH': 3, 'STRONG_BULLISH': 4}
+            worst_state = min(states, key=lambda x: priority.get(x, 2))
+            idx = states.index(worst_state)
+            return worst_state, changes[idx], tfs_used[idx]
+        elif len(states) == 1:
+            return states[0], changes[0], tfs_used[0]
+        else:
+            return 'NEUTRAL', 0.0, 'unknown'
+        
+    except Exception as e:
+        print(f"⚠️ BTC state check error: {str(e)[:60]}")
+        return 'NEUTRAL', 0.0, 'unknown'
 
 # ============================================
 # POSITION SIZING CALCULATOR
@@ -649,18 +666,12 @@ def calculate_position_size(price, stop_loss, confidence, account_size, risk_per
 def write_to_feed(signals, timeframe, btc_state=None, feed_path="./data/alerts.json"):
     if not signals:
         return
-
-    # Non-crypto instruments (gold via Binance futures, metals/forex/indices via
-    # cTrader) don't track BTC, so they carry btc_state=null. Everything else is
-    # crypto by definition — new coins count automatically, no list to maintain.
-    non_crypto = set(BINANCE_FUTURES_SYMBOLS) | CTRADER_SYMBOL_SET
-
+    
     feed_entries = []
     for sig in signals:
         conf = round(sig["confidence"], 1)
         direction = "buy" if "BUY" in sig["signal_type"] else "sell"
-        is_crypto = sig["symbol"] not in non_crypto
-
+        
         # Normalise to cTrader symbol format: base currency + "USD" (e.g. BCH/USDT -> BCHUSD).
         # Handles slash pairs (BCH/USDT), futures (XAU/USDT:USDT), concatenated pairs
         # (BCHUSDT), and is idempotent for already-converted symbols (XAUUSD -> XAUUSD).
@@ -673,6 +684,9 @@ def write_to_feed(signals, timeframe, btc_state=None, feed_path="./data/alerts.j
             symbol = raw_symbol[:-4] + "USD"            # concatenated USDT pair -> base + USD
         else:
             symbol = raw_symbol                          # already USD (or other) -> unchanged
+
+        # Only crypto tracks BTC's macro state; metals (XAU/XAG futures) carry null.
+        is_crypto = sig["symbol"] not in FUTURES_SYMBOLS
 
         entry = {
             "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -721,22 +735,7 @@ def write_to_feed(signals, timeframe, btc_state=None, feed_path="./data/alerts.j
 # SUGGESTED ENTRY/EXIT PRICES (3 TARGETS)
 # ============================================
 
-# ATR-based SL/TP for cTrader instruments (FX/indices/metals): their moves aren't
-# comparable to crypto's percentage swings, so size stops/targets by volatility.
-ATR_PERIOD = 14
-ATR_STOP_MULT = 1.5
-ATR_TP_MULTS = (1.5, 3.0, 4.5)  # ~1R / 2R / 3R relative to the ATR stop
-
-def atr(high, low, close, period=ATR_PERIOD):
-    """Average True Range — sizes SL/TP for cTrader instruments by volatility."""
-    h, l, c = np.asarray(high, float), np.asarray(low, float), np.asarray(close, float)
-    if len(h) < period + 1:
-        return float(h[-1] - l[-1])
-    tr = np.maximum(h[1:] - l[1:],
-                    np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
-    return float(np.mean(tr[-period:]))
-
-def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_val, params, rsi_1h=None, atr_value=None):
+def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_val, params, rsi_1h=None):
     result = {
         'entry': price,
         'stop_loss': None,
@@ -772,23 +771,18 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
         entry = max(adjusted_entry, lower * 1.005)
         result['entry'] = round(entry, 4)
         
-        if atr_value is not None and atr_value > 0:
-            # volatility-scaled exits (cTrader FX/indices/metals)
-            stop = entry - atr_value * ATR_STOP_MULT
-            tp1 = entry + atr_value * ATR_TP_MULTS[0]
-            tp2 = entry + atr_value * ATR_TP_MULTS[1]
-            tp3 = entry + atr_value * ATR_TP_MULTS[2]
-        else:
-            # percentage-based exits (crypto)
-            stop = min(price * (1 - stop_distance), lower * (1 - stop_distance * 0.4))
-            tp1 = min(mid, entry * (1 + tp1_pct * 0.5))
-            if tp1 <= entry:
-                tp1 = entry * (1 + tp1_pct * 0.5)
-            tp2 = entry * (1 + tp1_pct + (confidence / 100) * tp1_pct * 0.5)
-            tp3 = entry * (1 + tp2_pct + (confidence / 100) * tp2_pct * 0.5)
+        stop = min(price * (1 - stop_distance), lower * (1 - stop_distance * 0.4))
         result['stop_loss'] = round(stop, 4)
+        
+        tp1 = min(mid, entry * (1 + tp1_pct * 0.5))
+        if tp1 <= entry:
+            tp1 = entry * (1 + tp1_pct * 0.5)
         result['take_profit_1'] = round(tp1, 4)
+        
+        tp2 = entry * (1 + tp1_pct + (confidence / 100) * tp1_pct * 0.5)
         result['take_profit_2'] = round(tp2, 4)
+        
+        tp3 = entry * (1 + tp2_pct + (confidence / 100) * tp2_pct * 0.5)
         result['take_profit_3'] = round(tp3, 4)
         
         risk = entry - stop
@@ -804,23 +798,18 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
         entry = min(adjusted_entry, upper * 0.995)
         result['entry'] = round(entry, 4)
         
-        if atr_value is not None and atr_value > 0:
-            # volatility-scaled exits (cTrader FX/indices/metals)
-            stop = entry + atr_value * ATR_STOP_MULT
-            tp1 = entry - atr_value * ATR_TP_MULTS[0]
-            tp2 = entry - atr_value * ATR_TP_MULTS[1]
-            tp3 = entry - atr_value * ATR_TP_MULTS[2]
-        else:
-            # percentage-based exits (crypto)
-            stop = max(price * (1 + stop_distance), upper * (1 + stop_distance * 0.4))
-            tp1 = max(mid, entry * (1 - tp1_pct * 0.5))
-            if tp1 >= entry:
-                tp1 = entry * (1 - tp1_pct * 0.5)
-            tp2 = entry * (1 - tp1_pct - (confidence / 100) * tp1_pct * 0.5)
-            tp3 = entry * (1 - tp2_pct - (confidence / 100) * tp2_pct * 0.5)
+        stop = max(price * (1 + stop_distance), upper * (1 + stop_distance * 0.4))
         result['stop_loss'] = round(stop, 4)
+        
+        tp1 = max(mid, entry * (1 - tp1_pct * 0.5))
+        if tp1 >= entry:
+            tp1 = entry * (1 - tp1_pct * 0.5)
         result['take_profit_1'] = round(tp1, 4)
+        
+        tp2 = entry * (1 - tp1_pct - (confidence / 100) * tp1_pct * 0.5)
         result['take_profit_2'] = round(tp2, 4)
+        
+        tp3 = entry * (1 - tp2_pct - (confidence / 100) * tp2_pct * 0.5)
         result['take_profit_3'] = round(tp3, 4)
         
         risk = stop - entry
@@ -1207,17 +1196,17 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     params = get_timeframe_params(timeframe)
     results = []
     
-    # BTC macro bias from btc-scanner.py (canonical source; same value it reports)
-    btc_state, btc_score = get_btc_macro_bias()
-
+    # Get BTC market state for display
+    btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=1.5)
+    
     print(f"\n{'='*110}")
     print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*110}")
     print(f"Account: ${account_size:,} | Risk: {risk_percent*100:.1f}% per trade | Max Positions: {max_positions}")
     print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
     print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
-    print(f"Symbols: {len(SPOT_SYMBOLS)} crypto + {len(BINANCE_FUTURES_SYMBOLS)} gold (Binance) | cTrader bypassed")
-    print(f"BTC Macro Bias: {btc_state} (Score: {btc_score:+.0f})")
+    print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures")
+    print(f"BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
     print(f"Filters: Squeeze={'✅' if use_squeeze else '❌'} | SMRE={'✅' if use_smre else '❌'} | SMC={'✅' if use_smc else '❌'}")
     print(f"{'='*110}\n")
     
@@ -1250,13 +1239,10 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             if signals:
                 best = signals[0]
                 
-                # cTrader instruments (FX/indices/metals) get ATR-based SL/TP;
-                # crypto stays on the percentage model (atr_value=None).
-                atr_value = atr(high, low, close) if symbol in CTRADER_SYMBOL_SET else None
                 entry_exit = calculate_entry_exit(
                     current_price, lower, upper, mid,
                     best['type'], best['confidence'], rsi_val, params,
-                    rsi_1h=best.get('rsi_1h'), atr_value=atr_value
+                    rsi_1h=best.get('rsi_1h')
                 )
                 
                 position_size = calculate_position_size(
@@ -1422,11 +1408,11 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     
     print(f"{'='*110}")
 
-    # Write detected signals to the feed
+    # Write detected signals to the feed (btc_state attached to crypto entries)
     write_to_feed(signals_df.to_dict('records'), timeframe, btc_state=btc_state)
 
     # Display BTC state again after scan
-    print(f"\n📊 Final BTC Macro Bias: {btc_state} (Score: {btc_score:+.0f})")
+    print(f"\n📊 Final BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
 
     return df_results
 
@@ -1479,29 +1465,45 @@ def main():
     print(f"   SMRE Filters: {'ENABLED' if not args.no_smre else 'DISABLED'}")
     print(f"   SMC Filters: {'ENABLED' if use_smc else 'DISABLED'}")
     
-    start_time = time.time()
-    results = scan_with_signals(
-        args.timeframe,
-        args.verbose,
-        args.account_size,
-        args.risk,
-        args.max_positions,
-        use_squeeze=not args.no_squeeze,
-        use_smre=not args.no_smre,
-        use_smc=use_smc
-    )
-    elapsed = time.time() - start_time
-    
-    print(f"\n⏱️ Scan completed in {elapsed:.2f} seconds")
-    
-    if args.timeframe in ['1m', '5m', '15m']:
-        print(f"\n💡 Recommended scan frequency: Every {args.timeframe} (or more frequently for scalping)")
-    elif args.timeframe in ['30m', '1h']:
-        print(f"\n💡 Recommended scan frequency: Every 30-60 minutes")
-    elif args.timeframe in ['2h', '4h']:
-        print(f"\n💡 Recommended scan frequency: Every {args.timeframe}")
+    def _run_once():
+        t0 = time.time()
+        scan_with_signals(
+            args.timeframe,
+            args.verbose,
+            args.account_size,
+            args.risk,
+            args.max_positions,
+            use_squeeze=not args.no_squeeze,
+            use_smre=not args.no_smre,
+            use_smc=use_smc
+        )
+        print(f"\n⏱️ Scan completed in {time.time() - t0:.2f} seconds")
+
+    if args.loop > 0:
+        interval = args.loop * 60
+        print(f"🔁 Loop mode: scanning every {args.loop} min (aligned to the clock). Ctrl-C to stop.")
+        while True:
+            try:
+                _run_once()
+                # Sleep to the next wall-clock interval boundary so runs land on
+                # round times (e.g. :00/:15/:30/:45 for --loop 15) and the process
+                # stays continuously online instead of exiting between scans.
+                sleep_for = interval - (time.time() % interval)
+                print(f"😴 Next scan in {sleep_for/60:.1f} min...\n")
+                time.sleep(sleep_for)
+            except KeyboardInterrupt:
+                print("\n👋 Scanner stopped.")
+                break
     else:
-        print(f"\n💡 Recommended scan frequency: Every {args.timeframe} or daily")
+        _run_once()
+        if args.timeframe in ['1m', '5m', '15m']:
+            print(f"\n💡 Recommended scan frequency: Every {args.timeframe} (or more frequently for scalping)")
+        elif args.timeframe in ['30m', '1h']:
+            print(f"\n💡 Recommended scan frequency: Every 30-60 minutes")
+        elif args.timeframe in ['2h', '4h']:
+            print(f"\n💡 Recommended scan frequency: Every {args.timeframe}")
+        else:
+            print(f"\n💡 Recommended scan frequency: Every {args.timeframe} or daily")
 
 if __name__ == "__main__":
     main()
