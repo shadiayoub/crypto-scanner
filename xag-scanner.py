@@ -461,6 +461,7 @@ def build_feed_entry(sig, plan, tf):
         'confidence': round(sig['conf'], 1),
         'sl': plan['stop'],
         'tp': plan['tp1'],
+        'btc_state': None,  # silver isn't crypto — no BTC market state attached
         'signal_source': 'xag_scanner'
     }
 

@@ -117,7 +117,7 @@ Examples:
 
 # Spot symbols (standard)
 SPOT_SYMBOLS = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT',
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT',
     'LINK/USDT', 'AVAX/USDT', 'SUI/USDT', 'NEAR/USDT',
     'WIF/USDT', 'ARB/USDT', 'OP/USDT', 'AAVE/USDT', 'ADA/USDT',
     'AIXBT/USDT', 'ALGO/USDT', 'APT/USDT', 'ASTER/USDT', 'ATOM/USDT',
@@ -669,15 +669,21 @@ def calculate_position_size(price, stop_loss, confidence, account_size, risk_per
 # FEED WRITER
 # ============================================
 
-def write_to_feed(signals, timeframe, feed_path="./data/alerts.json"):
+def write_to_feed(signals, timeframe, btc_state=None, feed_path="./data/alerts.json"):
     if not signals:
         return
-    
+
+    # Non-crypto instruments (gold via Binance futures, metals/forex/indices via
+    # cTrader) don't track BTC, so they carry btc_state=null. Everything else is
+    # crypto by definition — new coins count automatically, no list to maintain.
+    non_crypto = set(BINANCE_FUTURES_SYMBOLS) | CTRADER_SYMBOL_SET
+
     feed_entries = []
     for sig in signals:
         conf = round(sig["confidence"], 1)
         direction = "buy" if "BUY" in sig["signal_type"] else "sell"
-        
+        is_crypto = sig["symbol"] not in non_crypto
+
         # Normalise to cTrader symbol format: base currency + "USD" (e.g. BCH/USDT -> BCHUSD).
         # Handles slash pairs (BCH/USDT), futures (XAU/USDT:USDT), concatenated pairs
         # (BCHUSDT), and is idempotent for already-converted symbols (XAUUSD -> XAUUSD).
@@ -703,6 +709,7 @@ def write_to_feed(signals, timeframe, feed_path="./data/alerts.json"):
             "confidence": conf,
             "sl": sig["stop_loss"],
             "tp": sig["tp1"],
+            "btc_state": btc_state if is_crypto else None,
             "signal_source": "signal_scanner"
         }
         feed_entries.append(entry)
@@ -1439,7 +1446,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"{'='*110}")
 
     # Write detected signals to the feed
-    write_to_feed(signals_df.to_dict('records'), timeframe)
+    write_to_feed(signals_df.to_dict('records'), timeframe, btc_state=btc_state)
 
     # Display BTC state again after scan
     print(f"\n📊 Final BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")

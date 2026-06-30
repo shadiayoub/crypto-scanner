@@ -545,8 +545,8 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
             c += 5
 
         c = float(np.clip(c, 0, 100))
-        if c < min_conf:
-            continue
+        # min_conf filtering happens in run_scan() after sorting; don't re-check
+        # here (min_conf isn't in scope, and the earlier c < 50 gate already culls).
 
         signals.append({
             'dir':     sig['dir'],
