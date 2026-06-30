@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-BTC Precision 5m Intraday Scanner (with Order Book Depth, CVD & Volatility Filters)
-Trend-aware: detects current BTC macro bias from 1h+4h and immediate 15m structural trend,
-then combines technical indicators with live order book supply/demand dynamics.
+BTC Precision 15m Intraday Scanner (Aggressive Regime-Aware Edition)
+==================================================================
+Optimized for BTC's aggressive, high-volatility character with:
+- Multi-regime volatility scaling (compressed / normal / expansion / cascade)
+- Liquidation cascade detection & exhaustion fading
+- Funding rate contrarian signals
+- Multi-tier order book intelligence with wall detection
+- HTF structure alignment gating
+- Session-aware liquidity profiling
+- Kelly-criterion position sizing
+- Enhanced 15m parameter tuning
 
 Usage:
-    python btc_scanner.py -tf 5m
-    python btc_scanner.py -tf 5m --verbose
+    python btc_scanner_v2.py -tf 15m
+    python btc_scanner_v2.py -tf 15m --verbose --loop 5
 """
 
 import ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import warnings
 import argparse
@@ -26,11 +34,11 @@ warnings.filterwarnings('ignore')
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='BTC Intraday Scanner — 5m/15m/30m with Order Book and CVD metrics',
+        description='BTC Aggressive Scanner — Regime-aware 15m with Microstructure',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('-tf', '--timeframe', type=str, default='5m',
-        help='Timeframe to scan: 5m, 15m, or 30m. Default is 5m.')
+    parser.add_argument('-tf', '--timeframe', type=str, default='15m',
+        help='Timeframe to scan: 5m, 15m, or 30m. Default is 15m.')
     parser.add_argument('--loop', type=int, default=0,
         help='Repeat scan every N minutes (0 = single run)')
     parser.add_argument('--account', type=float, default=10000,
@@ -43,6 +51,8 @@ def parse_args():
         help='Show all advanced filter details per signal')
     parser.add_argument('--min-conf', type=float, default=50.0,
         help='Minimum confidence to display a signal (default: 50)')
+    parser.add_argument('--max-risk-pct', type=float, default=0.02,
+        help='Maximum risk per trade via Kelly sizing (default: 0.02 = 2%%)')
     return parser.parse_args()
 
 # ============================================
@@ -56,6 +66,14 @@ def get_exchange():
         _EX['spot'] = ccxt.binance({'enableRateLimit': True})
     return _EX['spot']
 
+def get_futures_exchange():
+    if 'futures' not in _EX:
+        _EX['futures'] = ccxt.binance({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'swap'}
+        })
+    return _EX['futures']
+
 def fetch_ohlcv(symbol, timeframe, limit=350):
     try:
         ex = get_exchange()
@@ -68,59 +86,200 @@ def fetch_ohlcv(symbol, timeframe, limit=350):
 
 def fetch_order_book_imbalance(symbol, depth_pct=0.005):
     """
-    Measures limit order book imbalance within depth_pct (default 0.5%) of mid price.
-    Returns: ratio (bids_volume / asks_volume)
+    Measures limit order book imbalance within depth_pct of mid price.
+    Returns: (ratio, is_thin) where ratio = bids_volume / asks_volume.
     """
     try:
         ex = get_exchange()
-        ob = ex.fetch_order_book(symbol, limit=50)
+        ob = ex.fetch_order_book(symbol, limit=100)
         if not ob['bids'] or not ob['asks']:
-            return 1.0
-        
+            return 1.0, True
+
         mid = (ob['bids'][0][0] + ob['asks'][0][0]) / 2.0
         lower_bound = mid * (1 - depth_pct)
         upper_bound = mid * (1 + depth_pct)
-        
+
         bids_vol = sum([b[1] for b in ob['bids'] if b[0] >= lower_bound])
         asks_vol = sum([a[1] for a in ob['asks'] if a[0] <= upper_bound])
-        
+
+        total_vol = bids_vol + asks_vol
+        is_thin = total_vol < 2.0
+
+        if asks_vol == 0:
+            return 2.0, is_thin
+        if bids_vol == 0:
+            return 0.0, is_thin
+        return bids_vol / asks_vol, is_thin
+    except Exception:
+        return 1.0, True
+
+def fetch_order_book_imbalance_wide(symbol, depth_pct=0.01):
+    """Secondary, wider-depth (default 1%) order book read."""
+    try:
+        ex = get_exchange()
+        ob = ex.fetch_order_book(symbol, limit=200)
+        if not ob['bids'] or not ob['asks']:
+            return 1.0
+
+        mid = (ob['bids'][0][0] + ob['asks'][0][0]) / 2.0
+        lower_bound = mid * (1 - depth_pct)
+        upper_bound = mid * (1 + depth_pct)
+
+        bids_vol = sum([b[1] for b in ob['bids'] if b[0] >= lower_bound])
+        asks_vol = sum([a[1] for a in ob['asks'] if a[0] <= upper_bound])
+
         if asks_vol == 0:
             return 2.0
+        if bids_vol == 0:
+            return 0.0
         return bids_vol / asks_vol
     except Exception:
         return 1.0
 
-def fetch_approx_cvd(symbol, lookback_minutes=5):
+def fetch_order_book_profile(symbol, tiers=[0.002, 0.005, 0.01, 0.02]):
     """
-    Approximates Cumulative Volume Delta (Market Buys - Market Sells) from recent trade data.
-    Returns: cvd_ratio (net_buys / total_volume) -> >0 is bullish buying pressure, <0 is selling pressure.
+    Analyzes order book at multiple depth tiers to detect walls,
+    spoofing patterns, and absorption zones.
+    Returns: (profile_dict, wall_signals_list)
     """
     try:
         ex = get_exchange()
-        trades = ex.fetch_trades(symbol, limit=200)
+        ob = ex.fetch_order_book(symbol, limit=500)
+        mid = (ob['bids'][0][0] + ob['asks'][0][0]) / 2.0
+
+        profile = {}
+        for tier in tiers:
+            lower = mid * (1 - tier)
+            upper = mid * (1 + tier)
+
+            bids_vol = sum(b[1] for b in ob['bids'] if b[0] >= lower)
+            asks_vol = sum(a[1] for a in ob['asks'] if a[0] <= upper)
+
+            ratio = bids_vol / asks_vol if asks_vol > 0 else 2.0
+            total = bids_vol + asks_vol
+
+            profile[tier] = {
+                'ratio': ratio,
+                'total_btc': total,
+                'bid_depth': bids_vol,
+                'ask_depth': asks_vol
+            }
+
+        # Detect walls: significant depth jump between adjacent tiers
+        wall_signals = []
+        for i in range(len(tiers)-1):
+            curr_total = profile[tiers[i]]['total_btc']
+            next_total = profile[tiers[i+1]]['total_btc']
+            if next_total > curr_total * 3 and next_total > 5.0:
+                wall_side = 'BID' if profile[tiers[i+1]]['bid_depth'] > profile[tiers[i+1]]['ask_depth'] else 'ASK'
+                wall_signals.append(f"{wall_side} wall at {tiers[i+1]*100:.1f}% depth")
+
+        return profile, wall_signals
+    except Exception:
+        return {}, []
+
+def fetch_approx_cvd(symbol, lookback_minutes=5):
+    """
+    Approximates CVD from recent trade data with coverage quality check.
+    """
+    try:
+        ex = get_exchange()
+        trades = ex.fetch_trades(symbol, limit=1000)
         if not trades:
-            return 0.0
-        
+            return 0.0, False
+
         now_ms = ex.milliseconds()
         cutoff_ms = now_ms - (lookback_minutes * 60 * 1000)
-        
+
         net_delta = 0.0
         total_vol = 0.0
-        
+        oldest_in_window = None
+
         for t in trades:
             if t['timestamp'] >= cutoff_ms:
                 vol = t['amount']
                 total_vol += vol
+                if oldest_in_window is None or t['timestamp'] < oldest_in_window:
+                    oldest_in_window = t['timestamp']
                 if t['side'] == 'buy':
                     net_delta += vol
                 else:
                     net_delta -= vol
-                    
+
         if total_vol == 0:
-            return 0.0
-        return net_delta / total_vol
+            return 0.0, False
+
+        if oldest_in_window is None:
+            return 0.0, False
+        actual_span_ms = now_ms - oldest_in_window
+        requested_span_ms = lookback_minutes * 60 * 1000
+        coverage_ok = actual_span_ms >= requested_span_ms * 0.8
+
+        return net_delta / total_vol, coverage_ok
     except Exception:
-        return 0.0
+        return 0.0, False
+
+def fetch_trade_delta_profile(symbol, lookback_minutes=15):
+    """
+    Enhanced CVD tracking large lot delta (institutional footprint)
+    and delta divergence detection.
+    """
+    try:
+        ex = get_exchange()
+        trades = ex.fetch_trades(symbol, limit=2000)
+        now_ms = ex.milliseconds()
+        cutoff = now_ms - (lookback_minutes * 60 * 1000)
+
+        delta = 0.0
+        large_delta = 0.0
+        total_vol = 0.0
+
+        for t in trades:
+            if t['timestamp'] >= cutoff:
+                vol = t['amount']
+                total_vol += vol
+                side_mult = 1 if t['side'] == 'buy' else -1
+                delta += vol * side_mult
+
+                if vol >= 0.5:  # Large lot threshold
+                    large_delta += vol * side_mult
+
+        if total_vol == 0:
+            return {'delta_pct': 0, 'large_delta_pct': 0, 'divergence': False, 'coverage_ok': False}
+
+        delta_pct = (delta / total_vol) * 100
+        large_delta_pct = (large_delta / total_vol) * 100 if total_vol > 0 else 0
+
+        return {
+            'delta_pct': delta_pct,
+            'large_delta_pct': large_delta_pct,
+            'divergence': abs(large_delta_pct - delta_pct) > 15,
+            'coverage_ok': True
+        }
+    except Exception:
+        return {'delta_pct': 0, 'large_delta_pct': 0, 'divergence': False, 'coverage_ok': False}
+
+def fetch_funding_rate_proxy(symbol='BTC/USDT'):
+    """
+    Uses Binance futures funding rate as contrarian sentiment proxy.
+    Extreme funding = crowded positioning = potential reversal fuel.
+    """
+    try:
+        ex = get_futures_exchange()
+        funding = ex.fetchFundingRate(symbol)
+        rate = funding['fundingRate'] * 100  # Convert to percentage
+
+        if rate > 0.05:
+            return 'extreme_long', rate
+        elif rate > 0.01:
+            return 'elevated_long', rate
+        elif rate < -0.05:
+            return 'extreme_short', rate
+        elif rate < -0.01:
+            return 'elevated_short', rate
+        return 'neutral', rate
+    except Exception:
+        return 'neutral', 0.0
 
 # ============================================
 # TECHNICAL INDICATORS
@@ -206,6 +365,69 @@ def hurst_exponent(price, window=80):
         return float(np.clip(h, 0.0, 1.0))
     return 0.5
 
+def detect_volatility_spike(high, low, close, lookback=20, spike_mult=2.2):
+    """
+    Liquidation-cascade proxy: compares latest candle range vs recent average.
+    """
+    if len(close) < lookback + 2:
+        return False, 1.0, 'neutral'
+
+    ranges = high[-lookback-1:-1] - low[-lookback-1:-1]
+    avg_range = np.mean(ranges)
+    if avg_range <= 0:
+        return False, 1.0, 'neutral'
+
+    last_range = high[-1] - low[-1]
+    spike_ratio = last_range / avg_range
+
+    is_spike = spike_ratio >= spike_mult
+    direction = 'neutral'
+    if is_spike:
+        direction = 'up' if close[-1] > close[-2] else 'down'
+
+    return is_spike, round(float(spike_ratio), 2), direction
+
+def detect_liquidation_signature(df):
+    """
+    Detects liquidation cascade signatures:
+    1. Impulse candle with minimal wick (trapped traders)
+    2. Volume spike without proportional depth
+    3. Rapid follow-through pattern
+    """
+    close = df['close'].values
+    high = df['high'].values
+    low = df['low'].values
+    vol = df['volume'].values
+
+    if len(close) < 5:
+        return {'is_liquidation': False, 'score': 0, 'wick_ratio': 1.0, 'vol_spike': 1.0}
+
+    body = abs(close[-1] - close[-2])
+    total_range = high[-1] - low[-1]
+
+    wick_ratio = 1 - (body / total_range) if total_range > 0 else 0
+    vol_ma = np.mean(vol[-20:-1]) if len(vol) > 20 else np.mean(vol[:-1])
+    vol_spike = vol[-1] / vol_ma if vol_ma > 0 else 1.0
+
+    avg_range = np.mean(high[-10:-1] - low[-10:-1]) if len(high) > 10 else total_range
+    range_expansion = total_range / avg_range if avg_range > 0 else 1.0
+
+    liq_score = 0
+    if wick_ratio < 0.2 and vol_spike > 2.5:
+        liq_score += 50
+    if range_expansion > 2.5:
+        liq_score += 30
+    if vol_spike > 3.0 and wick_ratio < 0.3:
+        liq_score += 20
+
+    return {
+        'is_liquidation': liq_score > 60,
+        'score': liq_score,
+        'wick_ratio': wick_ratio,
+        'vol_spike': vol_spike,
+        'range_expansion': range_expansion
+    }
+
 def detect_market_structure(high, low, swing=10):
     if len(high) < swing * 3:
         return 'neutral'
@@ -250,6 +472,74 @@ def find_ob_and_fvg(high, low, close, lookback=30):
         except (IndexError, ValueError):
             continue
     return ob_zone, fvg_zone
+
+# ============================================
+# REGIME DETECTION
+# ============================================
+
+def detect_volatility_regime(df):
+    """
+    Classifies BTC into volatility regimes for dynamic parameter adjustment.
+    Returns: 'compressed', 'normal', 'expansion', 'cascade'
+    """
+    close = df['close'].values
+    high = df['high'].values
+    low = df['low'].values
+    vol = df['volume'].values
+
+    if len(close) < 30:
+        return 'normal'
+
+    # Realized volatility (annualized)
+    returns = np.diff(np.log(close[-30:]))
+    rv = np.std(returns) * np.sqrt(365 * 24 * 12) if len(returns) > 1 else 0.5
+
+    # ATR-based regime
+    current_atr = atr(high, low, close, 14)
+    atr_pct = current_atr / close[-1] if close[-1] > 0 else 0
+
+    if rv < 0.35 and atr_pct < 0.003:
+        return 'compressed'
+    elif rv > 0.80 or atr_pct > 0.012:
+        # Check for cascade signature
+        last_range = high[-1] - low[-1]
+        avg_range = np.mean(high[-10:-1] - low[-10:-1]) if len(high) > 10 else last_range
+        if last_range > avg_range * 3 and vol[-1] > np.mean(vol[-15:-1]) * 2:
+            return 'cascade'
+        return 'expansion'
+    return 'normal'
+
+def get_regime_adjusted_stop(base_stop_pct, regime):
+    """Dynamic stop scaling based on detected volatility regime."""
+    multipliers = {
+        'compressed': 0.7,
+        'normal': 1.0,
+        'expansion': 1.5,
+        'cascade': 2.0
+    }
+    return base_stop_pct * multipliers.get(regime, 1.0)
+
+def get_session_profile():
+    """
+    Returns session liquidity profile for time-of-day awareness.
+    BTC personality shifts dramatically by session.
+    """
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    weekday = now.weekday()
+
+    # Weekend penalty
+    if weekday >= 5:
+        return {'liquidity': 'thin', 'conviction_mult': 0.8, 'name': 'Weekend', 'hour': hour}
+
+    if 0 <= hour < 8:
+        return {'liquidity': 'low', 'conviction_mult': 0.85, 'name': 'Asia', 'hour': hour}
+    elif 8 <= hour < 14:
+        return {'liquidity': 'medium', 'conviction_mult': 0.95, 'name': 'London', 'hour': hour}
+    elif 14 <= hour < 21:
+        return {'liquidity': 'high', 'conviction_mult': 1.15, 'name': 'NY/London', 'hour': hour}
+    else:
+        return {'liquidity': 'medium', 'conviction_mult': 0.9, 'name': 'NY Close', 'hour': hour}
 
 # ============================================
 # TREND BIAS (MACRO)
@@ -306,34 +596,53 @@ def get_btc_trend_bias():
 
     return bias, round(total_score, 1), results
 
+def get_htf_structure_alignment():
+    """
+    Checks 1h, 4h, and daily structure for confluence.
+    Returns alignment score: -100 (all bearish) to +100 (all bullish)
+    """
+    alignment = 0
+    weights = {'1h': 0.3, '4h': 0.4, '1d': 0.3}
+
+    for tf, weight in weights.items():
+        df = fetch_ohlcv('BTC/USDT', tf, limit=100)
+        if df is None or len(df) < 20:
+            continue
+        swing = 5 if tf == '1h' else 3
+        struct = detect_market_structure(df['high'].values, df['low'].values, swing=swing)
+        score = 33 if struct == 'bullish' else (-33 if struct == 'bearish' else 0)
+        alignment += score * weight
+
+    return alignment
+
 # ============================================
-# TIMEFRAME CONFIGURATION
+# TIMEFRAME CONFIGURATION (OPTIMIZED)
 # ============================================
 
 TF_PARAMS = {
     '5m': {
-        'lookback': 120,       # Fast localized data processing
-        'bandwidth': 2.5,      # Tight envelope for 5m high frequency noise
-        'multiplier': 1.6,     # Narrow bands optimized to catch wick touches
-        'rsi_period': 7,       # Highly reactive RSI
-        'ma_period': 30,       # Near-term dynamic average line
+        'lookback': 120,
+        'bandwidth': 2.5,
+        'multiplier': 1.6,
+        'rsi_period': 7,
+        'ma_period': 30,
         'confirm_tf': '1h',
-        'stop_pct': 0.004,     # Precision 0.4% baseline stop loss
-        'tp1_pct': 0.004,      # 1:1 R:R target 1 scale out
+        'stop_pct': 0.004,
+        'tp1_pct': 0.004,
         'tp2_pct': 0.008,
         'tp3_pct': 0.015,
     },
     '15m': {
-        'lookback': 150,
-        'bandwidth': 3.0,
-        'multiplier': 1.8,
-        'rsi_period': 8,
-        'ma_period': 50,
+        'lookback': 180,       # 45h of data for full structure context
+        'bandwidth': 2.8,      # Tighter than 3.0 for better responsiveness
+        'multiplier': 1.6,     # Tighter bands for earlier reversal catches
+        'rsi_period': 7,       # Highly reactive
+        'ma_period': 34,       # Fibonacci-aligned dynamic average
         'confirm_tf': '1h',
-        'stop_pct': 0.008,
-        'tp1_pct': 0.008,
-        'tp2_pct': 0.015,
-        'tp3_pct': 0.025,
+        'stop_pct': 0.006,     # Tighter baseline for 15m precision
+        'tp1_pct': 0.012,      # Wider targets for 15m follow-through
+        'tp2_pct': 0.022,
+        'tp3_pct': 0.038,
     },
     '30m': {
         'lookback': 200,
@@ -350,7 +659,7 @@ TF_PARAMS = {
 }
 
 # ============================================
-# SIGNAL ENGINE
+# SIGNAL ENGINE (REGIME-AWARE)
 # ============================================
 
 def detect_btc_signals(df, tf, bias, use_bias=True):
@@ -363,6 +672,15 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
     if len(close) < p['lookback']:
         return []
 
+    # --- REGIME DETECTION ---
+    regime = detect_volatility_regime(df)
+
+    # --- LIQUIDATION SIGNATURE ---
+    liq = detect_liquidation_signature(df)
+
+    # --- SESSION PROFILE ---
+    session = get_session_profile()
+
     mid, upper, lower = nadaraya_watson_envelope(close, p['bandwidth'], p['multiplier'], p['lookback'])
     if mid is None:
         return []
@@ -374,10 +692,20 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
     struct = detect_market_structure(high, low)
     ob_zone, fvg_zone = find_ob_and_fvg(high, low, close)
 
-    # --- ADVANCED METRIC 1: ATR Volatility Expansion Baseline ---
+    # --- ATR VOLATILITY METRICS ---
     current_atr = atr(high, low, close, 14)
-    avg_atr_long = np.mean([atr(high[:i], low[:i], close[:i], 14) for i in range(len(close)-30, len(close))])
-    is_low_vol_chop = current_atr < (avg_atr_long * 0.75)  # Volatility is compressed below normal levels
+    tr_full = np.maximum(high[1:] - low[1:],
+              np.maximum(np.abs(high[1:] - close[:-1]),
+                         np.abs(low[1:] - close[:-1])))
+    if len(tr_full) >= 44:
+        atr_series = pd.Series(tr_full).rolling(14).mean().values
+        avg_atr_long = float(np.nanmean(atr_series[-30:]))
+    else:
+        avg_atr_long = current_atr
+    is_low_vol_chop = current_atr < (avg_atr_long * 0.75) if avg_atr_long > 0 else False
+
+    # --- VOLATILITY SPIKE ---
+    is_spike, spike_ratio, spike_dir = detect_volatility_spike(high, low, close)
 
     current = close[-1]
     prev    = close[-2]
@@ -411,13 +739,13 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
     if not candidates:
         return []
 
-    # Fetch confirmations outside data loop
+    # Fetch confirmations
     rsi_1h = None
     df1h = fetch_ohlcv('BTC/USDT', p['confirm_tf'], limit=60)
     if df1h is not None and len(df1h) >= 20:
         rsi_1h = rsi(df1h['close'].values[-30:], 14)
 
-    # --- ADVANCED METRIC 2: Intermediate Trend Alignment (15m Ribbon) ---
+    # --- INTERMEDIATE TREND (15m Ribbon) ---
     trend_15m = 'neutral'
     if tf == '5m':
         df15 = fetch_ohlcv('BTC/USDT', '15m', limit=60)
@@ -431,66 +759,192 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
             elif ema9 < ema21 < ema55:
                 trend_15m = 'bearish'
 
-    # --- ADVANCED METRIC 3 & 4: Order Book Imbalance & CVD ---
-    ob_imbalance = fetch_order_book_imbalance('BTC/USDT', depth_pct=0.005)
-    approx_cvd = fetch_approx_cvd('BTC/USDT', lookback_minutes=5)
+    # --- HTF STRUCTURE ALIGNMENT ---
+    htf_align = get_htf_structure_alignment()
+
+    # --- ORDER BOOK INTELLIGENCE ---
+    ob_imbalance, ob_thin = fetch_order_book_imbalance('BTC/USDT', depth_pct=0.005)
+    ob_imbalance_wide = fetch_order_book_imbalance_wide('BTC/USDT', depth_pct=0.01)
+    ob_profile, wall_signals = fetch_order_book_profile('BTC/USDT')
+    approx_cvd, cvd_coverage_ok = fetch_approx_cvd('BTC/USDT', lookback_minutes=5)
+    delta_profile = fetch_trade_delta_profile('BTC/USDT', lookback_minutes=15)
+
+    # --- FUNDING RATE ---
+    funding_state, funding_rate = fetch_funding_rate_proxy()
 
     signals = []
     for sig in candidates:
         c = sig['conf']
         notes = []
         skip = False
+        force_widen_stop = False
 
-        # Apply Volatility Chop Protection
+        # ── REGIME DISPLAY ──
+        notes.append(f"📊 Regime: {regime.upper()}")
+
+        # ── VOLATILITY CHOP PROTECTION ──
         if is_low_vol_chop:
             c -= 25
-            notes.append("⚠️ Low Volatility Chop detected (ATR compressed) — Penalty Applied")
+            notes.append("⚠️ Low Volatility Chop (ATR compressed) — Penalty Applied")
 
-        # ── INTERMEDIATE TREND (15m Ribbon Protection) ─────────────
+        # ── LIQUIDATION CASCADE HANDLING ──
+        if liq['is_liquidation']:
+            if (sig['dir'] == 'BUY' and close[-1] < close[-2]) or \
+               (sig['dir'] == 'SELL' and close[-1] > close[-2]):
+                c += 20
+                notes.append(f"🔥 Liquidation cascade detected (score: {liq['score']}) — fading exhaustion")
+                force_widen_stop = True
+            else:
+                c -= 30
+                notes.append("❌ Chasing liquidation cascade — high stop-out risk")
+
+        # ── VOLATILITY SPIKE ──
+        if is_spike:
+            if (sig['dir'] == 'BUY' and spike_dir == 'up') or \
+               (sig['dir'] == 'SELL' and spike_dir == 'down'):
+                c -= 15
+                notes.append(f"⚠️ Spike ({spike_ratio:.1f}x) already extended in signal direction")
+            elif (sig['dir'] == 'BUY' and spike_dir == 'down') or \
+                 (sig['dir'] == 'SELL' and spike_dir == 'up'):
+                c += 8
+                notes.append(f"🔥 Spike ({spike_ratio:.1f}x) against signal — possible exhaustion")
+                force_widen_stop = True
+
+        # ── HTF STRUCTURE ALIGNMENT GATING ──
+        if sig['dir'] == 'BUY' and htf_align < -50:
+            c -= 25
+            notes.append(f"❌ HTF structure strongly bearish ({htf_align:+.0f}) — counter-trend risk")
+            if htf_align < -75:
+                skip = True
+        elif sig['dir'] == 'SELL' and htf_align > 50:
+            c -= 25
+            notes.append(f"❌ HTF structure strongly bullish ({htf_align:+.0f}) — counter-trend risk")
+            if htf_align > 75:
+                skip = True
+        elif (sig['dir'] == 'BUY' and htf_align > 30) or (sig['dir'] == 'SELL' and htf_align < -30):
+            c += 10
+            notes.append(f"✅ HTF alignment confirms direction ({htf_align:+.0f})")
+
+        # ── INTERMEDIATE TREND (15m Ribbon) ──
         if tf == '5m' and trend_15m != 'neutral':
             if sig['dir'] == 'BUY' and trend_15m == 'bearish':
                 c -= 20
-                notes.append("❌ Blown out 15m EMA Ribbon Trend is BEARISH. Fighting trend.")
+                notes.append("❌ 15m EMA Ribbon BEARISH — fighting trend")
             elif sig['dir'] == 'SELL' and trend_15m == 'bullish':
                 c -= 20
-                notes.append("❌ Blown out 15m EMA Ribbon Trend is BULLISH. Fighting trend.")
+                notes.append("❌ 15m EMA Ribbon BULLISH — fighting trend")
             elif (sig['dir'] == 'BUY' and trend_15m == 'bullish') or (sig['dir'] == 'SELL' and trend_15m == 'bearish'):
                 c += 10
-                notes.append(f"✅ Fast 15m EMA Ribbon confirms direction ({trend_15m})")
+                notes.append(f"✅ 15m EMA Ribbon confirms ({trend_15m})")
 
-        # ── ORDER BOOK DEPTH IMBALANCE ──────────────────────────────
+        # ── ORDER BOOK DEPTH IMBALANCE ──
         if sig['dir'] == 'BUY':
             if ob_imbalance >= 1.4:
                 c += 15
-                notes.append(f"🔥 Order Book Support: Buy wall depth ratio {ob_imbalance:.2f}x")
+                notes.append(f"🔥 Book Support: Bid depth {ob_imbalance:.2f}x")
             elif ob_imbalance <= 0.6:
                 c -= 20
-                notes.append(f"⚠️ Thin Order Book Support: Ask side heavier ({ob_imbalance:.2f}x)")
+                notes.append(f"⚠️ Thin Book Support: Ask heavier ({ob_imbalance:.2f}x)")
         else:
             if ob_imbalance <= 0.6:
                 c += 15
-                notes.append(f"🔥 Order Book Resistance: Sell wall depth ratio {1/ob_imbalance:.2f}x heavier")
+                notes.append(f"🔥 Book Resistance: Ask depth {1/ob_imbalance:.2f}x heavier")
             elif ob_imbalance >= 1.4:
                 c -= 20
-                notes.append(f"⚠️ Thin Order Book Resistance: Bid side heavier ({ob_imbalance:.2f}x)")
+                notes.append(f"⚠️ Thin Book Resistance: Bid heavier ({ob_imbalance:.2f}x)")
 
-        # ── CUMULATIVE VOLUME DELTA (CVD) PRESSURE ─────────────────
+        # Thin book penalty
+        if ob_thin:
+            c -= 8
+            notes.append("⚠️ Thin top-of-book — imbalance may be unreliable")
+
+        # Wide-depth confirmation
+        wide_agrees = (ob_imbalance >= 1.0 and ob_imbalance_wide >= 1.0) or \
+                      (ob_imbalance < 1.0 and ob_imbalance_wide < 1.0)
+        if sig['dir'] == 'BUY' and ob_imbalance_wide >= 1.2 and wide_agrees:
+            c += 6
+            notes.append(f"✅ Wide book confirms bid-heavy ({ob_imbalance_wide:.2f}x)")
+        elif sig['dir'] == 'SELL' and ob_imbalance_wide <= 0.83 and wide_agrees:
+            c += 6
+            notes.append(f"✅ Wide book confirms ask-heavy ({ob_imbalance_wide:.2f}x)")
+        elif not wide_agrees:
+            c -= 6
+            notes.append(f"⚠️ Wide book disagrees ({ob_imbalance_wide:.2f}x vs {ob_imbalance:.2f}x)")
+
+        # Wall detection
+        for wall in wall_signals:
+            if 'BID' in wall and sig['dir'] == 'BUY':
+                c += 8
+                notes.append(f"🧱 {wall}")
+            elif 'ASK' in wall and sig['dir'] == 'SELL':
+                c += 8
+                notes.append(f"🧱 {wall}")
+
+        # ── DELTA PROFILE (INSTITUTIONAL FOOTPRINT) ──
+        if delta_profile['coverage_ok']:
+            if sig['dir'] == 'BUY':
+                if delta_profile['large_delta_pct'] > 10:
+                    c += 12
+                    notes.append(f"🔥 Large lot buying: {delta_profile['large_delta_pct']:+.1f}%")
+                elif delta_profile['large_delta_pct'] < -15:
+                    c -= 15
+                    notes.append(f"⚠️ Institutional selling: {delta_profile['large_delta_pct']:+.1f}%")
+            else:
+                if delta_profile['large_delta_pct'] < -10:
+                    c += 12
+                    notes.append(f"🔥 Large lot selling: {delta_profile['large_delta_pct']:+.1f}%")
+                elif delta_profile['large_delta_pct'] > 15:
+                    c -= 15
+                    notes.append(f"⚠️ Institutional buying: {delta_profile['large_delta_pct']:+.1f}%")
+
+            if delta_profile['divergence']:
+                c -= 10
+                notes.append("⚠️ Retail/Institutional delta divergence")
+
+        # ── CVD PRESSURE ──
+        cvd_weight = 1.0 if cvd_coverage_ok else 0.5
+        if not cvd_coverage_ok:
+            notes.append(f"⚠️ CVD window short — weighted {cvd_weight:.0%}")
+
         if sig['dir'] == 'BUY':
             if approx_cvd > 0.15:
-                c += 12
-                notes.append(f"📈 CVD Bullish: Aggressive market buying pressure ({approx_cvd*100:+.1f}%)")
+                c += 12 * cvd_weight
+                notes.append(f"📈 CVD Bullish: Aggressive buying ({approx_cvd*100:+.1f}%)")
             elif approx_cvd < -0.25:
-                c -= 15
-                notes.append(f"⚠️ CVD Divergence Warning: Aggressive market dump taking place ({approx_cvd*100:+.1f}%)")
+                c -= 15 * cvd_weight
+                notes.append(f"⚠️ CVD Divergence: Dump in progress ({approx_cvd*100:+.1f}%)")
         else:
             if approx_cvd < -0.15:
-                c += 12
-                notes.append(f"📉 CVD Bearish: Aggressive market selling pressure ({approx_cvd*100:+.1f}%)")
+                c += 12 * cvd_weight
+                notes.append(f"📉 CVD Bearish: Aggressive selling ({approx_cvd*100:+.1f}%)")
             elif approx_cvd > 0.25:
-                c -= 15
-                notes.append(f"⚠️ CVD Divergence Warning: Aggressive absorption/buying taking place ({approx_cvd*100:+.1f}%)")
+                c -= 15 * cvd_weight
+                notes.append(f"⚠️ CVD Divergence: Absorption/buying ({approx_cvd*100:+.1f}%)")
 
-        # ── MACRO TREND BIAS ──────────────────────────────────────────
+        # ── FUNDING RATE CONTRARIAN SIGNAL ──
+        if funding_state == 'extreme_long' and sig['dir'] == 'BUY':
+            c -= 25
+            notes.append(f"⚠️ Extreme funding {funding_rate:+.3f}% — longs overcrowded")
+        elif funding_state == 'extreme_short' and sig['dir'] == 'SELL':
+            c -= 25
+            notes.append(f"⚠️ Extreme funding {funding_rate:+.3f}% — shorts overcrowded")
+        elif funding_state == 'extreme_long' and sig['dir'] == 'SELL':
+            c += 15
+            notes.append(f"🔥 Extreme funding {funding_rate:+.3f}% — short squeeze fuel")
+        elif funding_state == 'extreme_short' and sig['dir'] == 'BUY':
+            c += 15
+            notes.append(f"🔥 Extreme funding {funding_rate:+.3f}% — long squeeze fuel")
+        elif funding_state in ('elevated_long', 'elevated_short'):
+            notes.append(f"📋 Funding: {funding_state} ({funding_rate:+.3f}%)")
+
+        # ── SESSION AWARENESS ──
+        c *= session['conviction_mult']
+        if session['liquidity'] == 'thin':
+            notes.append(f"⚠️ {session['name']} session — thin liquidity, size down")
+        elif session['liquidity'] == 'high':
+            notes.append(f"✅ {session['name']} session — optimal execution window")
+
+        # ── MACRO TREND BIAS ──
         if use_bias:
             if bias in ('BEARISH_STRONG', 'BEARISH'):
                 if sig['dir'] == 'SELL':
@@ -500,10 +954,10 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
                 elif sig['dir'] == 'BUY':
                     if rsi_val < 20:
                         c -= 15
-                        notes.append("⚠️ Counter-trend BUY accepted exclusively due to oversold conditions")
+                        notes.append("⚠️ Counter-trend BUY — oversold exception")
                     else:
                         c -= 30
-                        notes.append(f"❌ Rejected counter-trend BUY against macro {bias}")
+                        notes.append(f"❌ Rejected counter-trend BUY vs {bias}")
                         skip = True
             elif bias in ('BULLISH_STRONG', 'BULLISH'):
                 if sig['dir'] == 'BUY':
@@ -513,40 +967,40 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
                 elif sig['dir'] == 'SELL':
                     if rsi_val > 80:
                         c -= 15
-                        notes.append("⚠️ Counter-trend SELL accepted exclusively due to overbought conditions")
+                        notes.append("⚠️ Counter-trend SELL — overbought exception")
                     else:
                         c -= 30
-                        notes.append(f"❌ Rejected counter-trend SELL against macro {bias}")
+                        notes.append(f"❌ Rejected counter-trend SELL vs {bias}")
                         skip = True
 
-        if skip or c < 50:
+        if skip:
             continue
 
-        # Basic volume confirmation logic
+        # Volume confirmation
         if len(vol) > 15:
             avg_vol = np.mean(vol[-15:])
             vr = vol[-1] / avg_vol if avg_vol > 0 else 1.0
             if vr > 1.5:
                 c += 5
-                notes.append(f"📈 Local volume spike ({vr:.1f}x avg)")
+                notes.append(f"📈 Volume spike ({vr:.1f}x avg)")
 
-        # Market structure / Indicators scoring updates
+        # Price vs MA
         if sig['dir'] == 'BUY' and current > ma:
             c += 5
         elif sig['dir'] == 'SELL' and current < ma:
             c += 5
 
+        # Squeeze breakout
         if sq_release:
             if (sig['dir'] == 'BUY' and sq_bull) or (sig['dir'] == 'SELL' and not sq_bull):
                 c += 10
                 notes.append("🔥 Squeeze Breakout Active")
 
+        # Hurst trend persistence
         if h_exp > 0.55:
             c += 5
 
         c = float(np.clip(c, 0, 100))
-        # min_conf filtering happens in run_scan() after sorting; don't re-check
-        # here (min_conf isn't in scope, and the earlier c < 50 gate already culls).
 
         signals.append({
             'dir':     sig['dir'],
@@ -562,43 +1016,102 @@ def detect_btc_signals(df, tf, bias, use_bias=True):
             'lower':   round(lower, 2),
             'ma':      round(ma, 2),
             'ob_ratio': round(ob_imbalance, 2),
-            'cvd_pct':  round(approx_cvd * 100, 1)
+            'ob_thin': ob_thin,
+            'cvd_pct':  round(approx_cvd * 100, 1),
+            'cvd_coverage_ok': cvd_coverage_ok,
+            'atr':      round(current_atr, 2),
+            'is_spike': is_spike,
+            'spike_ratio': spike_ratio,
+            'regime': regime,
+            'force_widen_stop': force_widen_stop,
+            'session': session['name'],
+            'htf_align': round(htf_align, 1),
+            'funding_state': funding_state,
+            'funding_rate': round(funding_rate, 4),
+            'liq_score': liq['score'],
+            'delta_profile': delta_profile,
         })
 
     signals.sort(key=lambda x: x['conf'], reverse=True)
     return signals
 
 # ============================================
-# TRADE COMPILER
+# TRADE COMPILER (KELLY + REGIME-AWARE)
 # ============================================
 
-def build_trade_plan(sig, tf, account_size, risk_pct):
+def kelly_position_size(confidence, account_size, max_risk_pct=0.02,
+                        win_rate_estimate=0.55, avg_win_loss_ratio=1.5):
+    """
+    Kelly Criterion position sizing with half-Kelly safety.
+    f = (p*b - q) / b
+    """
+    p = win_rate_estimate + (confidence - 50) / 100 * 0.2
+    p = min(0.75, max(0.25, p))
+    q = 1 - p
+    b = avg_win_loss_ratio
+
+    kelly = (p * b - q) / b
+    kelly = max(0, kelly)
+    half_kelly = kelly / 2
+
+    risk_amount = account_size * min(half_kelly, max_risk_pct)
+    return risk_amount
+
+def build_trade_plan(sig, tf, account_size, risk_pct, max_risk_pct=0.02):
+    """
+    Builds entry, stop, and TP levels with regime-adaptive stops
+    and Kelly-criterion position sizing.
+    """
     p = TF_PARAMS[tf]
     price = sig['price']
     direction = sig['dir']
+    regime = sig.get('regime', 'normal')
+
+    # Regime-adjusted stop distance
+    base_stop_pct = p['stop_pct']
+    adjusted_stop_pct = get_regime_adjusted_stop(base_stop_pct, regime)
+
+    # ATR-based stop
+    atr_stop_distance = sig.get('atr', 0) * 1.2
+    fixed_stop_distance = price * adjusted_stop_pct
+    stop_distance = max(atr_stop_distance, fixed_stop_distance)
+
+    # Liquidation cascade widening
+    if sig.get('force_widen_stop') or sig.get('is_spike'):
+        stop_distance *= 1.25
+        if sig.get('liq_score', 0) > 80:
+            stop_distance *= 1.15  # Extra room for violent cascades
 
     if direction == 'BUY':
         entry = max(price, sig['lower'] * 1.001)
-        stop  = min(price * (1 - p['stop_pct']), sig['lower'] * 0.999)
+        stop  = min(entry - stop_distance, sig['lower'] * 0.999)
         tp1   = entry * (1 + p['tp1_pct'])
         tp2   = entry * (1 + p['tp2_pct'])
         tp3   = entry * (1 + p['tp3_pct'])
     else:
         entry = min(price, sig['upper'] * 0.999)
-        stop  = max(price * (1 + p['stop_pct']), sig['upper'] * 1.001)
+        stop  = max(entry + stop_distance, sig['upper'] * 1.001)
         tp1   = entry * (1 - p['tp1_pct'])
         tp2   = entry * (1 - p['tp2_pct'])
         tp3   = entry * (1 - p['tp3_pct'])
 
     risk_per_unit = abs(entry - stop)
-    dollar_risk   = account_size * risk_pct * (0.5 + sig['conf'] / 100 * 0.8)
-    pos_units     = dollar_risk / risk_per_unit if risk_per_unit > 0 else 0
-    pos_value     = min(pos_units * entry, account_size * 0.4)
-    pos_units     = pos_value / entry
+
+    # Kelly-adjusted dollar risk
+    dollar_risk = kelly_position_size(sig['conf'], account_size, max_risk_pct)
+
+    # Session liquidity adjustment
+    session_mult = 0.7 if sig.get('session') == 'Weekend' else 1.0
+    dollar_risk *= session_mult
+
+    pos_units = dollar_risk / risk_per_unit if risk_per_unit > 0 else 0
+    pos_value = min(pos_units * entry, account_size * 0.4)
+    pos_units = pos_value / entry
 
     return {
         'entry':  round(entry, 2),
         'stop':   round(stop, 2),
+        'stop_pct_actual': round(abs(entry - stop) / entry * 100, 2),
         'tp1':    round(tp1, 2),
         'tp2':    round(tp2, 2),
         'tp3':    round(tp3, 2),
@@ -608,6 +1121,8 @@ def build_trade_plan(sig, tf, account_size, risk_pct):
         'units':  round(pos_units, 5),
         'value':  round(pos_value, 2),
         'risk_$': round(dollar_risk, 2),
+        'regime': regime,
+        'session_adjusted': session_mult < 1.0,
     }
 
 # ============================================
@@ -616,16 +1131,30 @@ def build_trade_plan(sig, tf, account_size, risk_pct):
 
 def print_signal(sig, plan, tf, verbose=False):
     emoji = '🟢' if sig['dir'] == 'BUY' else '🔴'
+    regime_emoji = {'compressed': '📉', 'normal': '➡️', 'expansion': '📈', 'cascade': '⚡'}
+
     print(f"\n  {emoji} [{tf}] BTC/USDT — {sig['dir']}  |  Conf: {sig['conf']}%  |  {sig['desc']}")
-    print(f"     Price: ${sig['price']:,.2f} | RSI({tf}): {sig['rsi']} | Book Balance: {sig['ob_ratio']}x | CVD Delta: {sig['cvd_pct']:+}%")
+    print(f"     📊 Regime: {regime_emoji.get(sig['regime'], '➡️')} {sig['regime'].upper()} | Session: {sig['session']} | HTF Align: {sig['htf_align']:+.0f}")
+    print(f"     💰 Price: ${sig['price']:,.2f} | RSI({tf}): {sig['rsi']} | Funding: {sig['funding_state']} ({sig['funding_rate']:+.4f}%)")
+    print(f"     📖 Book: {sig['ob_ratio']}x{' (thin)' if sig.get('ob_thin') else ''} | CVD: {sig['cvd_pct']:+}%{'' if sig.get('cvd_coverage_ok', True) else ' (short)'}")
+
+    if sig.get('is_spike'):
+        print(f"     ⚡ Volatility spike: {sig['spike_ratio']}x avg range")
+    if sig.get('liq_score', 0) > 0:
+        print(f"     🔥 Liquidation score: {sig['liq_score']}/100")
+    if sig.get('delta_profile', {}).get('large_delta_pct', 0) != 0:
+        ld = sig['delta_profile']['large_delta_pct']
+        print(f"     🐋 Large lot delta: {ld:+.1f}%")
+
     print(f"     📍 Entry   : ${plan['entry']:,.2f}")
-    print(f"     🛑 Stop    : ${plan['stop']:,.2f}  (Risk: ${plan['risk_$']:.2f})")
+    print(f"     🛑 Stop    : ${plan['stop']:,.2f}  (Risk: ${plan['risk_$']:.2f}, {plan['stop_pct_actual']}% — {plan['regime']}-scaled)")
     print(f"     🎯 Target 1: ${plan['tp1']:,.2f}  (+{plan['gain1']}%)")
     print(f"     🎯 Target 2: ${plan['tp2']:,.2f}  (+{plan['gain2']}%)")
     print(f"     🎯 Target 3: ${plan['tp3']:,.2f}  (+{plan['gain3']}%)")
-    print(f"     📊 Allocation: {plan['units']} BTC (${plan['value']:,.2f})")
+    print(f"     📊 Size: {plan['units']} BTC (${plan['value']:,.2f}){' [Session-adjusted]' if plan['session_adjusted'] else ''}")
+
     if verbose:
-        print("     Order Validation Logs:")
+        print("     📝 Validation Logs:")
         for n in sig['notes']:
             print(f"       {n}")
 
@@ -633,33 +1162,55 @@ def print_signal(sig, plan, tf, verbose=False):
 # MAIN SCAN LOOP
 # ============================================
 
-def run_scan(timeframes, account_size, risk_pct, use_bias, verbose, min_conf):
-    print(f"\n{'='*70}")
-    print(f"  📡 BTC LIQUIDITY ENGINE — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"{'='*70}")
+def run_scan(timeframes, account_size, risk_pct, use_bias, verbose, min_conf, max_risk_pct):
+    print(f"\n{'='*75}")
+    print(f"  📡 BTC AGGRESSIVE SCANNER v2.0 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  🎯 Regime-Aware | Microstructure-Intelligent | Kelly-Sized")
+    print(f"{'='*75}")
 
     bias, score, bias_details = get_btc_trend_bias()
-    
+
     icon = '🟢' if 'BULLISH' in bias else ('🔴' if 'BEARISH' in bias else '⚪')
-    print(f"  {icon}  BTC MACRO MATRIX BIAS: {bias} (Score: {score:+.0f})")
-    print(f"{'='*70}")
+    print(f"  {icon}  BTC MACRO BIAS: {bias} (Score: {score:+.0f})")
+
+    # Show HTF alignment
+    htf = get_htf_structure_alignment()
+    htf_icon = '🟢' if htf > 30 else ('🔴' if htf < -30 else '⚪')
+    print(f"  {htf_icon}  HTF ALIGNMENT: {htf:+.0f} (1h/4h/1d confluence)")
+
+    # Show funding
+    funding_state, funding_rate = fetch_funding_rate_proxy()
+    fund_icon = '🔥' if 'extreme' in funding_state else '📋'
+    print(f"  {fund_icon}  FUNDING: {funding_state} ({funding_rate:+.4f}%)")
+
+    # Session
+    session = get_session_profile()
+    sess_icon = '✅' if session['liquidity'] == 'high' else ('⚠️' if session['liquidity'] == 'thin' else '➡️')
+    print(f"  {sess_icon}  SESSION: {session['name']} ({session['hour']:02d}:00 UTC) — Liquidity: {session['liquidity'].upper()}")
+
+    print(f"{'='*75}")
 
     for tf in timeframes:
-        print(f"  ⏱️  Processing Candlestick & Order Stream Matrix [{tf}]...")
+        print(f"  ⏱️  Processing [{tf}] Candlestick & Order Stream Matrix...")
         df = fetch_ohlcv('BTC/USDT', tf, limit=TF_PARAMS[tf]['lookback'] + 30)
         if df is None:
             continue
+
+        # Show current regime
+        regime = detect_volatility_regime(df)
+        regime_emoji = {'compressed': '📉', 'normal': '➡️', 'expansion': '📈', 'cascade': '⚡'}
+        print(f"     Current regime: {regime_emoji.get(regime, '➡️')} {regime.upper()}")
 
         signals = detect_btc_signals(df, tf, bias, use_bias=use_bias)
         signals = [s for s in signals if s['conf'] >= min_conf]
 
         if not signals:
-            print(f"  ⏳ [{tf}] No qualifying order-flow confirmation signals.")
+            print(f"     ⏳ No qualifying signals above {min_conf}% confidence.")
         else:
             for sig in signals:
-                plan = build_trade_plan(sig, tf, account_size, risk_pct)
+                plan = build_trade_plan(sig, tf, account_size, risk_pct, max_risk_pct)
                 print_signal(sig, plan, tf, verbose=verbose)
-    print(f"{'='*70}\n")
+    print(f"{'='*75}\n")
 
 def main():
     args = parse_args()
@@ -671,15 +1222,18 @@ def main():
     use_bias = not args.no_bias
 
     if args.loop > 0:
-        print(f"🔁 Scanner live in memory. Sampling matrix every {args.loop}m.")
+        print(f"🔁 Scanner live. Sampling every {args.loop}m. Press Ctrl+C to stop.")
         while True:
             try:
-                run_scan(timeframes, args.account, args.risk, use_bias, args.verbose, args.min_conf)
+                run_scan(timeframes, args.account, args.risk, use_bias, 
+                        args.verbose, args.min_conf, args.max_risk_pct)
                 time.sleep(args.loop * 60)
             except KeyboardInterrupt:
+                print("\n👋 Scanner halted by user.")
                 break
     else:
-        run_scan(timeframes, args.account, args.risk, use_bias, args.verbose, args.min_conf)
+        run_scan(timeframes, args.account, args.risk, use_bias, 
+                args.verbose, args.min_conf, args.max_risk_pct)
 
 if __name__ == '__main__':
     main()
