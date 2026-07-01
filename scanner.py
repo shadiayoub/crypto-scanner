@@ -27,6 +27,7 @@ import argparse
 import sys
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
     
 # ============================================
@@ -123,18 +124,10 @@ Examples:
 
 # Spot symbols (standard)
 SPOT_SYMBOLS = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT',
-    'LINK/USDT', 'AVAX/USDT', 'SUI/USDT', 'NEAR/USDT',
-    'WIF/USDT', 'ARB/USDT', 'OP/USDT', 'AAVE/USDT', 'ADA/USDT',
-    'AIXBT/USDT', 'ALGO/USDT', 'APT/USDT', 'ASTER/USDT', 'ATOM/USDT',
-    'BCH/USDT', 'BNB/USDT', 'BONK/USDT', 'CRV/USDT', 'DOT/USDT',
-    'ETC/USDT', 'FIL/USDT', 'HBAR/USDT', 'INJ/USDT', 'JTO/USDT',
-    'JUP/USDT', 'KAITO/USDT', 'LDO/USDT', 'LIT/USDT', 'LTC/USDT',
-    'ONDO/USDT', 'PENGU/USDT', 'PNUT/USDT',
-    'POL/USDT', 'PUMP/USDT', 'RENDER/USDT', 'S/USDT',
-    'SHIB/USDT', 'STX/USDT', 'TAO/USDT', 'TIA/USDT',
-    'TRX/USDT', 'UNI/USDT', 'VIRTUAL/USDT', 'WLD/USDT', 
-    'ZEC/USDT'
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 
+    'LINK/USDT', 'AVAX/USDT', 'BCH/USDT', 
+    'BNB/USDT', 'CRV/USDT', 'DOT/USDT',
+    'ETC/USDT', 'LTC/USDT', 'TRX/USDT',
 ]
 
 # Futures symbols (for metals and other perpetuals)
@@ -147,28 +140,49 @@ FUTURES_SYMBOLS = [
 SYMBOLS = SPOT_SYMBOLS + FUTURES_SYMBOLS
 
 # ============================================
-# BTC-STATE CONFIDENCE ADJUSTMENT
+# BTC DOMINANCE / REGIME ENGINE (tunable)
 # ============================================
-# Direction-aware confidence adjustment (in percentage points) applied to CRYPTO
-# signals based on the current BTC market state. Metals (XAU/XAG) are never
-# affected. Bullish and neutral states have no effect. Tune freely; 0 = no effect.
-#   - In a bearish BTC regime, fade longs (penalise BUYs) and favour shorts (boost SELLs).
-BTC_STATE_CONFIDENCE_ADJ = {
-    'BUY': {
-        'STRONG_BEARISH': -20,
-        'BEARISH':        -10,
-        'NEUTRAL':          0,
-        'BULLISH':          0,
-        'STRONG_BULLISH':   0,
-    },
-    'SELL': {
-        'STRONG_BEARISH':   0,
-        'BEARISH':          0,
-        'NEUTRAL':          0,
-        'BULLISH':        -10,
-        'STRONG_BULLISH': -20,
-    },
+# The composite BTC state combines BTC's price direction with a *dominance* proxy
+# (BTC's performance vs an alt basket). Rising dominance = capital fleeing into BTC
+# → alts bleed → fade alt longs. Falling dominance = altseason rotation → favour longs.
+DOMINANCE_BASKET = ['ETH/USDT', 'SOL/USDT']   # alt proxy used to gauge BTC dominance
+BTC_PRICE_THRESHOLD = 0.5   # % move (avg 5/10-bar) to call BTC bullish/bearish (else neutral)
+BTC_DOMINANCE_THRESHOLD = 0.3  # BTC-minus-basket %; above → dominance RISING, below −thr → FALLING
+
+# Direction-aware confidence adjustment (percentage points) per composite regime,
+# applied to CRYPTO signals only (metals exempt). Tune freely; 0 = no effect.
+BTC_REGIME_CONFIDENCE_ADJ = {
+    # Dominance RISING → alts underperform → fade longs, favour shorts
+    'BTC_D_RISING_BULLISH':  {'BUY': -35, 'SELL': +15},
+    'BTC_D_RISING_BEARISH':  {'BUY': -40, 'SELL': +20},
+    'BTC_D_RISING_NEUTRAL':  {'BUY': -25, 'SELL': +10},
+    # Dominance FALLING → altseason rotation → favour longs
+    'BTC_D_FALLING_BULLISH': {'BUY': +20, 'SELL': -25},
+    'BTC_D_FALLING_BEARISH': {'BUY':  -5, 'SELL': +10},
+    'BTC_D_FALLING_NEUTRAL': {'BUY': +10, 'SELL': -10},
+    # Dominance FLAT → BTC price direction leads
+    'BTC_D_FLAT_BULLISH':    {'BUY': +10, 'SELL': -10},
+    'BTC_D_FLAT_BEARISH':    {'BUY': -15, 'SELL': +10},
+    'BTC_D_FLAT_NEUTRAL':    {'BUY':   0, 'SELL':   0},
 }
+
+# Hard regime filter: a signal whose direction fights the macro regime is blocked
+# unless its confidence clears this override. Metals exempt.
+REGIME_HARD_FILTER_MIN_CONF = 70
+REGIME_BLOCKS = {                      # composite_state -> direction that is blocked
+    'BTC_D_RISING_BULLISH':  'BUY',    # don't long alts while BTC dominance pumps
+    'BTC_D_RISING_BEARISH':  'BUY',    # alt-crush regime — hardest block on longs
+    'BTC_D_RISING_NEUTRAL':  'BUY',
+    'BTC_D_FALLING_BULLISH': 'SELL',   # don't short alts in altseason
+}
+
+def should_allow_signal(signal_type, composite_state, confidence):
+    """False → drop the signal (it fights the macro regime below the override conf)."""
+    blocked = REGIME_BLOCKS.get(composite_state)
+    if blocked is None:
+        return True
+    direction = 'BUY' if signal_type.startswith('BUY') else 'SELL'
+    return not (direction == blocked and confidence < REGIME_HARD_FILTER_MIN_CONF)
 
 # ============================================
 # TIMEFRAME-SPECIFIC PARAMETERS
@@ -573,6 +587,21 @@ def fetch_data(symbol, timeframe, limit=550):
         print(f"⚠️ {symbol}: fetch error - {str(e)[:60]}")
         return None
 
+def fetch_data_batch(symbols, timeframe, limit, max_workers=8):
+    """Fetch OHLCV for many symbols concurrently. Returns {symbol: df|None}.
+    Cuts a ~50-symbol scan from serial (~1 req at a time) to a handful of batches.
+    Per-symbol errors are isolated (fetch_data already returns None on failure)."""
+    out = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(fetch_data, s, timeframe, limit): s for s in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                out[sym] = fut.result()
+            except Exception:
+                out[sym] = None
+    return out
+
 def check_timeframe_confirmation(symbol, timeframe, rsi_period, signal_direction='BUY', rsi_threshold=35):
     """
     Fix #7: original always checked rsi < threshold (bullish confirmation only).
@@ -593,64 +622,78 @@ def check_timeframe_confirmation(symbol, timeframe, rsi_period, signal_direction
     return confirms, round(rsi_val, 2)
 
 # ============================================
-# BTC MARKET STATE (DISPLAY ONLY)
+# BTC COMPOSITE STATE (price direction + dominance)
 # ============================================
 
-def get_btc_market_state_higher_tf(timeframe, threshold=1.5):
+def _avg_change(symbol, timeframe, lookback_candles=20):
+    """Average of the 5-bar and 10-bar % change on `timeframe`. None on failure."""
+    df = fetch_data(symbol, timeframe, limit=lookback_candles)
+    if df is None or len(df) < 10:
+        return None
+    close = df['close'].values
+    cur = close[-1]
+    p5 = close[-5] if len(close) >= 5 else cur
+    p10 = close[-10] if len(close) >= 10 else cur
+    return ((cur - p5) / p5 * 100 + (cur - p10) / p10 * 100) / 2
+
+def _regime_description(dominance, price_dir):
+    if dominance == 'RISING':
+        return 'BTC DOMINANCE RISING — alts bleeding (ALT CRUSH risk)'
+    if dominance == 'FALLING':
+        return 'BTC DOMINANCE FALLING — capital rotating to alts (ALTSEASON)'
+    return f'DOMINANCE FLAT — following BTC {price_dir.lower()}'
+
+def get_btc_full_state(timeframe, lookback_candles=20):
+    """Composite BTC regime on the SAME timeframe as the scan.
+
+    Combines BTC's price direction with a dominance proxy (BTC vs the ETH/SOL
+    basket). Returns (composite_state, meta) where composite_state is one of the
+    BTC_D_<RISING|FALLING|FLAT>_<BULLISH|BEARISH|NEUTRAL> keys in
+    BTC_REGIME_CONFIDENCE_ADJ, and meta carries the numbers for the dashboard.
+    """
+    default = ('BTC_D_FLAT_NEUTRAL', {
+        'price_dir': 'NEUTRAL', 'dominance': 'FLAT', 'btc_change': 0.0,
+        'basket_change': 0.0, 'rel': 0.0,
+        'description': _regime_description('FLAT', 'NEUTRAL'), 'alt_bias': 'NEUTRAL'
+    })
     try:
-        if timeframe in ['1m', '5m', '15m']:
-            tfs_to_check = ['1h', '4h']
-        elif timeframe in ['30m', '1h']:
-            tfs_to_check = ['4h', '1d']
-        else:
-            tfs_to_check = ['1d']
-        
-        states = []
-        changes = []
-        tfs_used = []   # parallel to states/changes; a TF may be skipped below
+        btc_change = _avg_change('BTC/USDT', timeframe, lookback_candles)
+        if btc_change is None:
+            return default
 
-        for tf in tfs_to_check:
-            df = fetch_data('BTC/USDT', tf, limit=20)
-            if df is None or len(df) < 10:
-                continue
-            
-            close = df['close'].values
-            current_price = close[-1]
-            price_5_ago = close[-5] if len(close) >= 5 else current_price
-            price_10_ago = close[-10] if len(close) >= 10 else current_price
-            
-            change_5 = ((current_price - price_5_ago) / price_5_ago) * 100
-            change_10 = ((current_price - price_10_ago) / price_10_ago) * 100
-            avg_change = (change_5 + change_10) / 2
-            
-            if avg_change > threshold * 2:
-                state = 'STRONG_BULLISH'
-            elif avg_change > threshold:
-                state = 'BULLISH'
-            elif avg_change < -threshold * 2:
-                state = 'STRONG_BEARISH'
-            elif avg_change < -threshold:
-                state = 'BEARISH'
-            else:
-                state = 'NEUTRAL'
-            
-            states.append(state)
-            changes.append(avg_change)
-            tfs_used.append(tf)
+        basket = [c for c in (_avg_change(s, timeframe, lookback_candles) for s in DOMINANCE_BASKET) if c is not None]
+        basket_change = sum(basket) / len(basket) if basket else btc_change
 
-        if len(states) >= 2:
-            priority = {'STRONG_BEARISH': 0, 'BEARISH': 1, 'NEUTRAL': 2, 'BULLISH': 3, 'STRONG_BULLISH': 4}
-            worst_state = min(states, key=lambda x: priority.get(x, 2))
-            idx = states.index(worst_state)
-            return worst_state, changes[idx], tfs_used[idx]
-        elif len(states) == 1:
-            return states[0], changes[0], tfs_used[0]
+        # Price direction
+        if btc_change > BTC_PRICE_THRESHOLD:
+            price_dir = 'BULLISH'
+        elif btc_change < -BTC_PRICE_THRESHOLD:
+            price_dir = 'BEARISH'
         else:
-            return 'NEUTRAL', 0.0, 'unknown'
-        
+            price_dir = 'NEUTRAL'
+
+        # Dominance = BTC performance relative to the alt basket
+        rel = btc_change - basket_change
+        if rel > BTC_DOMINANCE_THRESHOLD:
+            dominance = 'RISING'
+        elif rel < -BTC_DOMINANCE_THRESHOLD:
+            dominance = 'FALLING'
+        else:
+            dominance = 'FLAT'
+
+        composite = f'BTC_D_{dominance}_{price_dir}'
+        alt_bias = {'RISING': 'SHORT-FAVORED', 'FALLING': 'LONG-FAVORED', 'FLAT': 'NEUTRAL'}[dominance]
+        meta = {
+            'price_dir': price_dir, 'dominance': dominance,
+            'btc_change': round(btc_change, 2), 'basket_change': round(basket_change, 2),
+            'rel': round(rel, 2),
+            'description': _regime_description(dominance, price_dir), 'alt_bias': alt_bias,
+        }
+        return composite, meta
+
     except Exception as e:
         print(f"⚠️ BTC state check error: {str(e)[:60]}")
-        return 'NEUTRAL', 0.0, 'unknown'
+        return default
 
 # ============================================
 # POSITION SIZING CALCULATOR
@@ -852,7 +895,7 @@ def calculate_entry_exit(price, lower, upper, mid, signal_type, confidence, rsi_
 # ENHANCED SIGNAL DETECTION WITH SQUEEZE + SMRE + SMC
 # ============================================
 
-def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol, params, use_squeeze=True, use_smre=True, use_smc=True, btc_state=None):
+def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol, params, use_squeeze=True, use_smre=True, use_smc=True, regime=None):
     current = price[-1]
     prev = price[-2]
     signals = []
@@ -1184,16 +1227,20 @@ def detect_signals(price, high, low, volume, rsi_val, lower, upper, mid, symbol,
         # ============================================
         # FINAL CONFIDENCE CALCULATION
         # ============================================
-        # BTC market-state adjustment (crypto only, direction-aware). Metals carry no
-        # BTC dependence, so they're excluded. See BTC_STATE_CONFIDENCE_ADJ to tune.
-        if symbol not in FUTURES_SYMBOLS and btc_state:
+        # BTC macro-regime adjustment + hard filter (crypto only; metals exempt).
+        if symbol not in FUTURES_SYMBOLS and regime:
             direction = 'BUY' if signal['type'].startswith('BUY') else 'SELL'
-            adj = BTC_STATE_CONFIDENCE_ADJ.get(direction, {}).get(btc_state, 0)
+            adj = BTC_REGIME_CONFIDENCE_ADJ.get(regime, {}).get(direction, 0)
             if adj:
                 confidence += adj
-                filters_triggered.append(f"₿ BTC {btc_state}: {adj:+d} conf")
+                filters_triggered.append(f"₿ {regime}: {adj:+d} conf")
 
         confidence = max(0, min(100, confidence))
+
+        # Hard regime block: a signal fighting the macro regime needs the override conf.
+        if symbol not in FUTURES_SYMBOLS and regime and not should_allow_signal(signal['type'], regime, confidence):
+            skip_signal = True
+            filters_triggered.append(f"⛔ {regime} blocks {signal['type']} (conf {confidence:.0f} < {REGIME_HARD_FILTER_MIN_CONF})")
 
         if confidence < 50:
             skip_signal = True
@@ -1230,9 +1277,9 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     params = get_timeframe_params(timeframe)
     results = []
     
-    # Get BTC market state for display
-    btc_state, btc_change, btc_tf = get_btc_market_state_higher_tf(timeframe, threshold=1.5)
-    
+    # Composite BTC regime (price direction + dominance) on the scan timeframe
+    regime, regime_meta = get_btc_full_state(timeframe)
+
     print(f"\n{'='*110}")
     print(f"📊 MULTI-ASSET SCANNER: {timeframe} | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*110}")
@@ -1240,13 +1287,23 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"Parameters: Bandwidth={params['bandwidth']}, Multiplier={params['multiplier']}, RSI={params['rsi_period']}")
     print(f"Confirmation: {params['confirmation_timeframe']} | MA{params['ma_period']} | Targets: {params['target_1_pct']*100:.0f}%/{params['target_2_pct']*100:.0f}%/{params['target_3_pct']*100:.0f}%")
     print(f"Symbols: {len(SPOT_SYMBOLS)} Spot + {len(FUTURES_SYMBOLS)} Futures")
-    print(f"BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
     print(f"Filters: Squeeze={'✅' if use_squeeze else '❌'} | SMRE={'✅' if use_smre else '❌'} | SMC={'✅' if use_smc else '❌'}")
+    # ── BTC REGIME DASHBOARD ────────────────────────────────────────────────
+    dom_icon = {'RISING': '🔺', 'FALLING': '🔻', 'FLAT': '➡️'}.get(regime_meta['dominance'], '➡️')
+    print(f"{'-'*110}")
+    print(f"🧭 BTC REGIME: {regime}")
+    print(f"   {dom_icon} BTC {regime_meta['btc_change']:+.2f}%  |  Alt basket {regime_meta['basket_change']:+.2f}%  "
+          f"|  Rel {regime_meta['rel']:+.2f}%  →  Dominance {regime_meta['dominance']}")
+    print(f"   {regime_meta['description']}")
+    print(f"   Altcoin bias: {regime_meta['alt_bias']}")
     print(f"{'='*110}\n")
-    
+
+    # Fetch all symbols concurrently (D), then scan from the pre-fetched map.
+    data_map = fetch_data_batch(SYMBOLS, timeframe, params['lookback'] + 50, max_workers=8)
+
     for symbol in SYMBOLS:
         try:
-            df = fetch_data(symbol, timeframe, params['lookback'] + 50)
+            df = data_map.get(symbol)
             if df is None or len(df) < params['lookback']:
                 continue
             
@@ -1267,7 +1324,7 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
             
             signals = detect_signals(
                 close, high, low, volume, rsi_val, lower, upper, mid, symbol, params,
-                use_squeeze=use_squeeze, use_smre=use_smre, use_smc=use_smc, btc_state=btc_state
+                use_squeeze=use_squeeze, use_smre=use_smre, use_smc=use_smc, regime=regime
             )
             
             if signals:
@@ -1443,10 +1500,10 @@ def scan_with_signals(timeframe, verbose, account_size, risk_percent, max_positi
     print(f"{'='*110}")
 
     # Write detected signals to the feed (btc_state attached to crypto entries)
-    write_to_feed(signals_df.to_dict('records'), timeframe, btc_state=btc_state)
+    write_to_feed(signals_df.to_dict('records'), timeframe, btc_state=regime)
 
     # Display BTC state again after scan
-    print(f"\n📊 Final BTC Market State: {btc_state} ({btc_change:.2f}%) on {btc_tf}")
+    print(f"\n🧭 BTC Regime: {regime} — {regime_meta['description']} (Altcoin bias: {regime_meta['alt_bias']})")
 
     return df_results
 
