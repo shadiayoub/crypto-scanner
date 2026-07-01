@@ -1179,6 +1179,7 @@ def build_feed_entry(sig, plan, tf):
         'direction': direction,
         'rsi': sig['rsi'],
         'price': plan['entry'],
+        'current_price': sig['price'],  # spot at generation; entry ('price') is the limit level
         'pivot_level': None,
         'pivot_distance': None,
         'confidence': round(sig['conf'], 1),

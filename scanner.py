@@ -719,6 +719,7 @@ def write_to_feed(signals, timeframe, btc_state=None, feed_path="./data/alerts.j
             "direction": direction,
             "rsi": sig["rsi"],
             "price": sig["entry"],
+            "current_price": sig["price"],  # spot at generation; entry ('price') is the limit level
             "pivot_level": None,
             "pivot_distance": None,
             "confidence": conf,

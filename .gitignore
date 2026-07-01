@@ -5,5 +5,5 @@ logs/
 data/
 __pycache__/
 btc-dom-scanner.py
-
+scanner.py.save
 .env
