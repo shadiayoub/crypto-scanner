@@ -165,8 +165,8 @@ BTC_STATE_CONFIDENCE_ADJ = {
         'STRONG_BEARISH':   0,
         'BEARISH':          0,
         'NEUTRAL':          0,
-        'BULLISH':          0,
-        'STRONG_BULLISH':   0,
+        'BULLISH':        -10,
+        'STRONG_BULLISH': -20,
     },
 }
 
